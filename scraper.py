@@ -167,12 +167,28 @@ def _detect_bandeja(page: Page, timeout_s: float = 30.0) -> bool:
 
 def _dump_debug(page: Page, tag: str) -> None:
     """Guarda HTML del estado actual para debuguear a posteriori.
-    El screenshot lo salteamos porque en SPAs con animaciones suele colgarse."""
+    Captura tanto el HTML estático como el DOM renderizado por JS, y
+    estado clave de Angular si está hidratado."""
     try:
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        html_path = DOWNLOAD_DIR / f"debug_{tag}_{int(time.time())}.html"
+        ts = int(time.time())
+        html_path = DOWNLOAD_DIR / f"debug_{tag}_{ts}.html"
         html_path.write_text(page.content(), encoding="utf-8")
         log(f"📄 html: {html_path}")
+
+        # DOM renderizado (después de JS) para ver qué está pasando con Angular.
+        try:
+            rendered = page.evaluate("""() => ({
+                ngVersion: document.querySelector('[ng-version]')?.getAttribute('ng-version'),
+                appRootChildren: document.querySelector('app-root')?.children.length || 0,
+                bodyTextLen: document.body?.innerText?.length || 0,
+                bodyTextPreview: document.body?.innerText?.substring(0, 300) || '',
+                docTitle: document.title,
+                visibleButtons: Array.from(document.querySelectorAll('button, a')).filter(e => e.offsetParent !== null).map(e => e.textContent.trim()).filter(Boolean).slice(0, 20),
+            })""")
+            log(f"🔬 render: {rendered}")
+        except Exception as e:
+            log(f"(no pude evaluar DOM renderizado: {e})")
     except Exception as e:
         log(f"(no pude capturar debug: {e})")
 
@@ -724,6 +740,15 @@ def _run_once() -> Path:
         # de exportar para no perder una descarga que dispara inmediatamente.
         captured_downloads: list[Download] = []
         page.on("download", lambda dl: captured_downloads.append(dl))
+
+        # Debug: capturar errores de consola y de página (exceptions JS).
+        page.on(
+            "console",
+            lambda msg: log(f"[browser console.{msg.type}] {msg.text[:200]}")
+            if msg.type in ("error", "warning")
+            else None,
+        )
+        page.on("pageerror", lambda err: log(f"[browser pageerror] {err}"))
 
         try:
             # Fast path: si ya estamos en la bandeja con Exportar visible,
