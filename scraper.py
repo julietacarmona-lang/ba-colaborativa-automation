@@ -194,14 +194,30 @@ def _dump_debug(page: Page, tag: str) -> None:
 
 
 def login(page: Page) -> None:
-    log("Abriendo bandeja (si hay sesión guardada, no va a pedir login)…")
-    # wait_until="commit" solo espera la primera respuesta del server.
-    # Así no nos peleamos con el redirect OIDC que dispara Keycloak.
+    # IMPORTANTE: vamos a la RAÍZ del backoffice, no directo a /contacto/bandeja.
+    # El redirect_uri del OIDC apunta a /, así que el SPA hace su bootstrap de
+    # OAuth ahí. Ir directo a /contacto/bandeja saltea ese bootstrap y la app
+    # queda colgada (visto en CI: backend devuelve 401, Angular nunca arranca).
+    log("Abriendo backoffice (raíz, para que arranque OAuth bien)…")
     try:
-        page.goto(BANDEJA_URL, wait_until="commit")
+        page.goto(BACKOFFICE_URL + "/", wait_until="commit")
     except Exception as e:
         if "interrupted" not in str(e).lower():
             raise
+
+    # Esperamos a que Angular esté HIDRATADO (no solo a que cargue el HTML).
+    log("Esperando que Angular arranque…")
+    try:
+        page.wait_for_function(
+            """() => {
+                const r = document.querySelector('app-root');
+                return r && r.children.length > 0;
+            }""",
+            timeout=45000,
+        )
+        log("✓ Angular hidratado.")
+    except PlaywrightTimeoutError:
+        log("⚠️  Angular no arrancó en 45s — sigo igual a ver qué dice el DOM.")
 
     log("Detectando estado de autenticación…")
     state = _detect_auth_state(page, timeout_s=30.0)
