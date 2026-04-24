@@ -10,3 +10,4 @@ downloads/
 .playwright/
 .playwright-user-data/
 session.json
+.claude/
