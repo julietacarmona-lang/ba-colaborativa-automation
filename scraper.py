@@ -799,7 +799,11 @@ def _connect_cdp(p):
 
 
 def _launch_persistent(p):
-    """Lanza un Chrome propio con user_data_dir (modo legacy, no-CDP)."""
+    """Lanza un Chrome propio con user_data_dir (modo legacy, no-CDP).
+
+    Config minimal — sin stealth, sin init scripts, sin ignore_default_args.
+    Probamos si Angular bootea con la config "vanilla" de Playwright.
+    """
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     launch_kwargs = dict(
         user_data_dir=str(USER_DATA_DIR),
@@ -807,37 +811,10 @@ def _launch_persistent(p):
         slow_mo=SLOW_MO,
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
-        user_agent=USER_AGENT,
-        ignore_default_args=[
-            "--enable-automation",
-            "--enable-blink-features=IdleDetection",
-            "--no-sandbox",
-        ],
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-sync",
-            "--disable-session-crashed-bubble",
-            "--disable-infobars",
-        ],
     )
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
         launch_kwargs["channel"] = BROWSER_CHANNEL
     context = p.chromium.launch_persistent_context(**launch_kwargs)
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
-
-    # Stealth: parchea ~30 señales que las apps usan para detectar Playwright.
-    try:
-        from playwright_stealth import stealth_sync
-        for pg in context.pages:
-            stealth_sync(pg)
-        context.on("page", lambda pg: stealth_sync(pg))
-        log("✓ Stealth aplicado al contexto.")
-    except Exception as e:
-        log(f"(stealth no aplicado: {e})")
 
     # Si hay cookies inyectadas (vía BA_SESSION_JSON), las cargamos para
     # evitar el form de login en CI.
