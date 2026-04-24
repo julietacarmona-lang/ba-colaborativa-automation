@@ -1,0 +1,874 @@
+"""Scraper de BA Colaborativa — descarga el export de la Bandeja de entrada.
+
+Flujo:
+  1. Login Keycloak con CUIL/CUIT + password.
+  2. Ir a Contactos → Bandeja.
+  3. Filtro Estado general = Abierto → Buscar.
+  4. Exportar → modal → "Todos los campos" → Exportar.
+  5. Esperar a que el reporte async se genere y descargar el archivo.
+
+Uso:
+  python scraper.py                 # corre el flujo completo, modo headful por default
+  HEADLESS=true python scraper.py   # headless (como corre en CI)
+  DEBUG_PAUSE=1 python scraper.py   # pausa con Playwright Inspector después del Exportar
+                                    # para identificar dónde aparece el link de descarga
+  KEEP_OPEN=1 python scraper.py     # no cierra el browser al terminar
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from playwright.sync_api import (
+    Download,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
+
+import notify
+
+load_dotenv()
+
+BA_USER = os.environ.get("BA_USER", "").strip()
+BA_PASSWORD = os.environ.get("BA_PASSWORD", "")
+HEADLESS = os.environ.get("HEADLESS", "false").strip().lower() in ("1", "true", "yes")
+SLOW_MO = int(os.environ.get("SLOW_MO", "150"))
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")).resolve()
+KEEP_OPEN = os.environ.get("KEEP_OPEN", "0") == "1"
+DEBUG_PAUSE = os.environ.get("DEBUG_PAUSE", "0") == "1"
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+# Nombre del filtro guardado a cargar antes de exportar. Si se define, el
+# script lo carga desde el dropdown "Filtros guardados" en vez de configurar
+# los filtros uno por uno.
+SAVED_FILTER_NAME = os.environ.get("SAVED_FILTER_NAME", "Asignados a Milton")
+# JSON con cookies pre-cargadas (saltea login). Se usa en CI con
+# BROWSER_MODE=persistent: el workflow inyecta cookies extraídas con
+# scripts/dump_cookies.py para evitar el form de login.
+BA_SESSION_JSON = os.environ.get("BA_SESSION_JSON", "").strip()
+USER_DATA_DIR = Path(os.environ.get("USER_DATA_DIR", "./.playwright-user-data")).resolve()
+CAPTCHA_MANUAL_TIMEOUT_MS = int(os.environ.get("CAPTCHA_MANUAL_TIMEOUT_MS", "300000"))
+LOGIN_MODE = os.environ.get("LOGIN_MODE", "manual").strip().lower()
+BROWSER_CHANNEL = os.environ.get("BROWSER_CHANNEL", "chrome").strip().lower()
+# Modo de browser:
+#   "cdp"        — conectarse a un Chrome que ya está corriendo en
+#                  --remote-debugging-port=CDP_PORT. Evita toda detección
+#                  de automation y usa la sesión real del usuario.
+#   "persistent" — Playwright lanza su propio Chrome con user_data_dir.
+BROWSER_MODE = os.environ.get("BROWSER_MODE", "cdp").strip().lower()
+CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+
+BACKOFFICE_URL = "https://bacolaborativa-backoffice.buenosaires.gob.ar"
+BANDEJA_URL = f"{BACKOFFICE_URL}/contacto/bandeja"
+
+# Tiempo máx de espera para que termine de generarse el reporte asíncrono.
+REPORT_WAIT_TIMEOUT_MS = 10 * 60 * 1000  # 10 minutos
+# Intervalo de polling mientras se espera el reporte.
+REPORT_POLL_INTERVAL_MS = 5000
+
+
+def log(msg: str) -> None:
+    print(f"[scraper] {msg}", flush=True)
+
+
+def is_logged_in(page: Page) -> bool:
+    """Heurística robusta: estamos logueadas si y solo si la URL es del
+    backoffice Y no se ve un input de password (que sería la pantalla de
+    Keycloak incluso si la URL ya muestra el backoffice por una fracción de
+    segundo antes del redirect OIDC)."""
+    try:
+        url = page.url
+    except Exception:
+        return False
+    if "identidad-gcaba" in url:
+        return False
+    if "bacolaborativa-backoffice.buenosaires.gob.ar" not in url:
+        return False
+    try:
+        # Si hay un password visible, estamos en el form de login.
+        if page.locator('input[type="password"]').first.is_visible(timeout=300):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _detect_auth_state(page: Page, timeout_s: float = 30.0) -> str:
+    """Mira el DOM y devuelve uno de:
+       - 'login'       — hay un input type=password visible → hay que loguearse
+       - 'backoffice'  — estoy en el backoffice sin form de login → logueada
+       - 'unknown'     — no detectó estado claro
+
+    Es distinto a 'estoy en la bandeja' — después de login, Keycloak suele
+    redirigir al home del backoffice, no directo a la bandeja.
+    """
+    pw = page.locator('input[type="password"]')
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    while time.time() < deadline:
+        if time.time() - last_log > 5:
+            try:
+                log(f"  … esperando (url={page.url[:80]}  title={page.title()!r})")
+            except Exception:
+                pass
+            last_log = time.time()
+
+        url = page.url
+        try:
+            if pw.first.is_visible(timeout=200):
+                return "login"
+        except Exception:
+            pass
+        if "bacolaborativa-backoffice" in url and "identidad-gcaba" not in url:
+            # En backoffice y sin password input visible → logueada.
+            return "backoffice"
+        page.wait_for_timeout(400)
+
+    _dump_debug(page, "auth_unknown")
+    return "unknown"
+
+
+def _detect_bandeja(page: Page, timeout_s: float = 30.0) -> bool:
+    """Una vez logueada, espera a que aparezcan controles típicos de la bandeja
+    (botón Exportar o Buscar)."""
+    bandeja_btn = page.get_by_role(
+        "button", name=re.compile(r"exportar|buscar", re.I)
+    )
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    while time.time() < deadline:
+        if time.time() - last_log > 5:
+            try:
+                log(f"  … buscando bandeja (url={page.url[:80]})")
+            except Exception:
+                pass
+            last_log = time.time()
+        try:
+            if bandeja_btn.first.is_visible(timeout=300):
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+    _dump_debug(page, "bandeja_not_found")
+    return False
+
+
+def _dump_debug(page: Page, tag: str) -> None:
+    """Guarda HTML del estado actual para debuguear a posteriori.
+    El screenshot lo salteamos porque en SPAs con animaciones suele colgarse."""
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        html_path = DOWNLOAD_DIR / f"debug_{tag}_{int(time.time())}.html"
+        html_path.write_text(page.content(), encoding="utf-8")
+        log(f"📄 html: {html_path}")
+    except Exception as e:
+        log(f"(no pude capturar debug: {e})")
+
+
+def login(page: Page) -> None:
+    log("Abriendo bandeja (si hay sesión guardada, no va a pedir login)…")
+    # wait_until="commit" solo espera la primera respuesta del server.
+    # Así no nos peleamos con el redirect OIDC que dispara Keycloak.
+    try:
+        page.goto(BANDEJA_URL, wait_until="commit")
+    except Exception as e:
+        if "interrupted" not in str(e).lower():
+            raise
+
+    log("Detectando estado de autenticación…")
+    state = _detect_auth_state(page, timeout_s=30.0)
+
+    if state == "backoffice":
+        log("✓ Ya estoy logueada en el backoffice.")
+        return
+    if state == "unknown":
+        raise RuntimeError(
+            "No pude determinar si hay que loguearse o no. "
+            "Revisá el screenshot en ./downloads/"
+        )
+    # state == "login" → hay que loguearse
+    log("Form de login detectado.")
+
+    if LOGIN_MODE == "manual":
+        log(
+            "LOGIN_MODE=manual — completá CUIL, contraseña, captcha e Ingresar a mano. "
+            f"Espero hasta {CAPTCHA_MANUAL_TIMEOUT_MS // 1000}s."
+        )
+        state = _detect_auth_state(page, timeout_s=CAPTCHA_MANUAL_TIMEOUT_MS / 1000)
+        if state == "backoffice":
+            log("✓ Login manual OK — sesión guardada para próximas corridas.")
+            return
+        raise RuntimeError(
+            f"Después del login manual no caí en el backoffice (estado={state}). "
+            "Probá de nuevo."
+        )
+
+    # Keycloak muestra un form con "Usuario (CUIL/CUIT)" y "Contraseña".
+    log("Esperando form de login…")
+    user_input = _first_visible(
+        page,
+        [
+            lambda: page.get_by_label(re.compile(r"CUIL.?CUIT|Usuario", re.I)),
+            lambda: page.locator("#username"),
+            lambda: page.locator('input[name="username"]'),
+        ],
+        timeout_ms=30000,
+    )
+    user_input.fill(BA_USER)
+
+    pw_input = _first_visible(
+        page,
+        [
+            lambda: page.get_by_label(re.compile(r"contraseña|password", re.I)),
+            lambda: page.locator("#password"),
+            lambda: page.locator('input[name="password"]'),
+        ],
+    )
+    pw_input.fill(BA_PASSWORD)
+
+    # Antes de clickear, chequeamos si hay captcha. Si lo hay y estamos en modo
+    # headful, pausamos para que lo resuelvas a mano.
+    if _captcha_present(page):
+        _wait_for_manual_captcha_solve(page)
+
+    log("Enviando credenciales…")
+    submit = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
+            lambda: page.locator('input[type="submit"]'),
+            lambda: page.locator('button[type="submit"]'),
+        ],
+    )
+    submit.click()
+
+    # Después de clickear Ingresar puede saltar un captcha interstitial.
+    # Si vemos uno y estamos headful, esperamos a que lo resuelvas.
+    try:
+        page.wait_for_url(
+            re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+            timeout=15000,
+        )
+    except PlaywrightTimeoutError:
+        if _captcha_present(page):
+            _wait_for_manual_captcha_solve(page)
+            page.wait_for_url(
+                re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+                timeout=120000,
+            )
+        else:
+            # Reintentamos esperar — puede estar yendo lento.
+            page.wait_for_url(
+                re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+                timeout=45000,
+            )
+    log("Login OK.")
+
+
+def _captcha_present(page: Page) -> bool:
+    """Detecta reCAPTCHA (iframe) o hCaptcha visible en la página actual."""
+    selectors = [
+        'iframe[src*="recaptcha"]',
+        'iframe[title*="reCAPTCHA" i]',
+        'iframe[src*="hcaptcha"]',
+        '.g-recaptcha',
+        '#captcha',
+    ]
+    for sel in selectors:
+        try:
+            if page.locator(sel).first.is_visible(timeout=1000):
+                return True
+        except Exception:
+            continue
+    # Texto explícito de error de captcha.
+    try:
+        if page.get_by_text(re.compile(r"captcha", re.I)).first.is_visible(timeout=500):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _wait_for_manual_captcha_solve(page: Page) -> None:
+    """En modo headful: pedimos al usuario que resuelva el captcha a mano y
+    esperamos hasta que la página navegue fuera de identidad-gcaba."""
+    if HEADLESS:
+        raise RuntimeError(
+            "Apareció un captcha y el scraper corre headless. "
+            "Corré primero en modo headful (HEADLESS=false) para guardar la sesión."
+        )
+    log(
+        "⚠️  CAPTCHA detectado. Resolvelo a mano en la ventana de Chromium "
+        "y apretá 'Ingresar'. Espero hasta "
+        f"{CAPTCHA_MANUAL_TIMEOUT_MS // 1000}s."
+    )
+    # Esperamos a que la URL salga de la pantalla de identidad.
+    try:
+        page.wait_for_url(
+            lambda url: "bacolaborativa-backoffice.buenosaires.gob.ar" in url,
+            timeout=CAPTCHA_MANUAL_TIMEOUT_MS,
+        )
+        log("✓ Captcha resuelto, seguimos.")
+    except PlaywrightTimeoutError:
+        raise RuntimeError(
+            "Se acabó el tiempo esperando que resuelvas el captcha a mano."
+        )
+
+
+def go_to_bandeja(page: Page) -> None:
+    """El SPA de BA Colaborativa rebota la URL directa al home y exige
+    navegación por menú (setea estado interno). Clickeamos 'Contactos' en el
+    navbar, y después 'Bandeja de entrada' en el dropdown."""
+    if _detect_bandeja(page, timeout_s=2.0):
+        log("Ya estoy en la bandeja.")
+        return
+
+    log("Abriendo dropdown 'Contactos'…")
+    contactos = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("button", name=re.compile(r"^\s*contactos\s*$", re.I)),
+            lambda: page.get_by_role("link", name=re.compile(r"^\s*contactos\s*$", re.I)),
+            lambda: page.locator("nav, header").get_by_text(
+                re.compile(r"^\s*contactos\s*$", re.I)
+            ),
+            lambda: page.get_by_text(re.compile(r"^\s*contactos\s*$", re.I)),
+        ],
+        timeout_ms=15000,
+    )
+    contactos.click()
+
+    log("Clickeando 'Bandeja de entrada'…")
+    bandeja_item = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("menuitem", name=re.compile(r"bandeja", re.I)),
+            lambda: page.get_by_role("link", name=re.compile(r"bandeja", re.I)),
+            lambda: page.locator('a, li, button').filter(
+                has_text=re.compile(r"bandeja", re.I)
+            ),
+        ],
+        timeout_ms=5000,
+    )
+    bandeja_item.click()
+
+    if not _detect_bandeja(page, timeout_s=30.0):
+        raise RuntimeError(
+            "Clickeé Contactos→Bandeja pero no aparecieron Exportar/Buscar. "
+            "Revisá el HTML en ./downloads/"
+        )
+    log("✓ Bandeja cargada vía menú.")
+
+
+def apply_filter_abierto_and_search(page: Page) -> None:
+    """Carga el filtro guardado SAVED_FILTER_NAME (por default 'Asignados a
+    Milton', que ya trae Estado=Abierto + Usuario asignado=Milton). Después
+    clickea Buscar."""
+    buscar_loc = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
+
+    def buscar_visible() -> bool:
+        try:
+            return buscar_loc.is_visible(timeout=500)
+        except Exception:
+            return False
+
+    if not buscar_visible():
+        log("Panel colapsado — clickeo header 'Criterios de búsqueda'…")
+        try:
+            header = _first_visible(
+                page,
+                [
+                    lambda: page.get_by_role("button", name=re.compile(r"criterios de b[uú]squeda", re.I)),
+                    lambda: page.get_by_text(re.compile(r"^\s*criterios de b[uú]squeda\s*$", re.I)),
+                ],
+                timeout_ms=5000,
+            )
+            header.click()
+            page.wait_for_timeout(800)
+        except PlaywrightTimeoutError:
+            log("(No encontré el header para expandir — sigo igual.)")
+    else:
+        log("✓ Panel ya expandido (Buscar visible).")
+
+    # Cargamos el filtro guardado.
+    if SAVED_FILTER_NAME:
+        _load_saved_filter(page, SAVED_FILTER_NAME)
+
+    log("Click en Buscar…")
+    buscar = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)),
+            lambda: page.locator('button:has-text("Buscar")'),
+        ],
+    )
+    buscar.click()
+    page.wait_for_timeout(3000)
+
+
+def _load_saved_filter(page: Page, filter_name: str) -> None:
+    """Abre el dropdown 'Filtros guardados', selecciona el filtro por nombre
+    y clickea 'Cargar'."""
+    log(f"Cargando filtro guardado '{filter_name}'…")
+
+    # Si ya está cargado (el nombre aparece en el dropdown), no hacemos nada.
+    try:
+        already_loaded = page.locator(".ng-value-label").filter(
+            has_text=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)
+        ).first
+        if already_loaded.is_visible(timeout=500):
+            log(f"✓ Filtro '{filter_name}' ya estaba cargado.")
+            return
+    except Exception:
+        pass
+
+    # Abrimos el dropdown de Filtros guardados. El ng-select está al lado del
+    # label "Filtros guardados".
+    try:
+        dropdown = _first_visible(
+            page,
+            [
+                lambda: page.locator(
+                    'xpath=//*[contains(normalize-space(.), "Filtros guardados")]/following::ng-select[1]'
+                ),
+                lambda: page.get_by_label(re.compile(r"Filtros guardados", re.I)),
+            ],
+            timeout_ms=5000,
+        )
+        dropdown.click()
+        page.wait_for_timeout(300)
+    except PlaywrightTimeoutError:
+        log("(No encontré el dropdown 'Filtros guardados' — omito la carga del filtro.)")
+        return
+
+    # Elegimos la opción con el nombre del filtro.
+    try:
+        opcion = _first_visible(
+            page,
+            [
+                lambda: page.get_by_role("option", name=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)),
+                lambda: page.locator(".ng-option").filter(
+                    has_text=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)
+                ),
+            ],
+            timeout_ms=5000,
+        )
+        opcion.click()
+        page.wait_for_timeout(400)
+    except PlaywrightTimeoutError:
+        log(f"⚠️  No encontré la opción '{filter_name}' en el dropdown. ¿Está bien escrito?")
+        return
+
+    # Clickeamos 'Cargar' para aplicar el filtro seleccionado.
+    try:
+        cargar = _first_visible(
+            page,
+            [
+                lambda: page.get_by_role("button", name=re.compile(r"^\s*cargar\s*$", re.I)),
+                lambda: page.locator('button:has-text("Cargar")'),
+            ],
+            timeout_ms=5000,
+        )
+        cargar.click()
+        page.wait_for_timeout(600)
+        log(f"✓ Filtro '{filter_name}' cargado.")
+    except PlaywrightTimeoutError:
+        log("⚠️  No encontré el botón 'Cargar' — el filtro puede no haberse aplicado.")
+
+
+def export_all_fields(page: Page) -> None:
+    log("Click en Exportar…")
+    exportar_btn = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("button", name=re.compile(r"^\s*exportar\s*$", re.I)),
+            lambda: page.locator('button:has-text("Exportar")'),
+        ],
+    )
+    exportar_btn.click()
+
+    log("Esperando modal 'Columnas a exportar'…")
+    # El modal puede no tener role=dialog — probamos varias estrategias.
+    modal = None
+    for factory in (
+        lambda: page.get_by_role("dialog"),
+        lambda: page.locator('[class*="modal"][class*="show"]'),
+        lambda: page.locator('.modal-dialog, .modal-content'),
+        # Buscamos el contenedor que tenga el título "Columnas a exportar".
+        lambda: page.locator('*').filter(
+            has=page.get_by_text(re.compile(r"Columnas a exportar", re.I))
+        ).locator('xpath=ancestor-or-self::*[self::div or self::dialog][1]'),
+    ):
+        try:
+            candidate = factory().first
+            candidate.wait_for(state="visible", timeout=5000)
+            modal = candidate
+            break
+        except PlaywrightTimeoutError:
+            continue
+
+    if modal is None:
+        _dump_debug(page, "modal_not_found")
+        raise RuntimeError(
+            "No apareció el modal 'Columnas a exportar' después de clickear Exportar. "
+            "Revisá el HTML en ./downloads/"
+        )
+
+    log("Abriendo dropdown 'Selección de campos'…")
+    # El campo es un ng-select con placeholder "Ingresá el nombre de los campos…"
+    # Clickeamos cualquier parte del control para desplegar las opciones.
+    seleccion = _first_visible(
+        page,
+        [
+            lambda: modal.locator("ng-select").first,
+            lambda: modal.get_by_placeholder(re.compile(r"Ingres[aá].*campos", re.I)),
+            lambda: modal.locator('[role="combobox"]').first,
+        ],
+        timeout_ms=10000,
+    )
+    seleccion.click()
+    page.wait_for_timeout(400)
+
+    log("Seleccionando 'Todos los campos'…")
+    # Las opciones del ng-select aparecen en un panel (puede estar fuera del modal
+    # en el DOM por portaling), así que buscamos en toda la page.
+    todos = _first_visible(
+        page,
+        [
+            lambda: page.get_by_role("option", name=re.compile(r"^\s*Todos los campos\s*$", re.I)),
+            lambda: page.locator(".ng-option").filter(
+                has_text=re.compile(r"^\s*Todos los campos\s*$", re.I)
+            ),
+            lambda: page.get_by_text(re.compile(r"^\s*Todos los campos\s*$", re.I)),
+        ],
+        timeout_ms=10000,
+    )
+    todos.click()
+    page.wait_for_timeout(400)
+
+    log("Confirmando Exportar dentro del modal…")
+    confirmar = _first_visible(
+        page,
+        [
+            lambda: modal.get_by_role("button", name=re.compile(r"^\s*exportar\s*$", re.I)),
+            lambda: modal.locator('button:has-text("Exportar")'),
+            lambda: page.locator('button:has-text("Exportar")').last,
+        ],
+    )
+    confirmar.click()
+
+
+def wait_for_report_and_download(page: Page, captured: list) -> Path:
+    """Espera a que aparezca la descarga. Tres escenarios:
+      - Playwright captura un evento `download` (listener en _run_once).
+      - Aparece el banner async y después un botón/link 'Descargar'.
+      - En modo CDP, Chrome baja el archivo a ~/Downloads sin disparar
+        el evento de Playwright. Fallback: polleamos ~/Downloads buscando
+        un archivo Reporte_BandejaDeEntrada_*.csv nuevo.
+    """
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot de ~/Downloads ANTES de esperar, para detectar archivos nuevos.
+    home_downloads = Path.home() / "Downloads"
+    existing_reports = _list_bandeja_reports(home_downloads)
+    start_time = time.time()
+
+    if captured:
+        log("✓ Descarga directa capturada.")
+        return _save_download(captured[0])
+
+    try:
+        page.get_by_text(
+            re.compile(r"El reporte se está generando", re.I)
+        ).wait_for(timeout=5000)
+        log("Banner de 'reporte generándose' detectado. Esperando que esté listo…")
+    except PlaywrightTimeoutError:
+        log("No vi banner async — sigo esperando la descarga.")
+
+    if DEBUG_PAUSE:
+        log("DEBUG_PAUSE=1 — clickeá la descarga a mano.")
+        page.pause()
+
+    deadline = time.time() + REPORT_WAIT_TIMEOUT_MS / 1000
+
+    while time.time() < deadline:
+        if captured:
+            return _save_download(captured[0])
+
+        # Fallback CDP: ¿apareció un archivo nuevo en ~/Downloads?
+        new_report = _find_new_bandeja_report(
+            home_downloads, existing_reports, min_mtime=start_time
+        )
+        if new_report:
+            target = DOWNLOAD_DIR / f"{int(time.time())}_{new_report.name}"
+            import shutil
+            shutil.move(str(new_report), str(target))
+            log(f"✓ Archivo detectado en ~/Downloads y movido a {target}")
+            return target
+
+        # Intentamos encontrar un botón/link "Descargar" visible.
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"^\s*descargar\s*$", re.I)),
+            page.get_by_role("link", name=re.compile(r"^\s*descargar\s*$", re.I)),
+            page.locator('a:has-text("Descargar")'),
+            page.locator('button:has-text("Descargar")'),
+        ]
+        for c in candidates:
+            try:
+                if c.first.is_visible(timeout=500):
+                    log("Encontré botón/link 'Descargar' — clickeando…")
+                    with page.expect_download(timeout=60000) as dl_info:
+                        c.first.click()
+                    return _save_download(dl_info.value)
+            except PlaywrightTimeoutError:
+                pass
+            except Exception:
+                pass
+
+        # Algunas apps ponen las descargas en una campana de notificaciones.
+        # Si aparece un ícono con badge, lo abrimos e intentamos de nuevo.
+        try:
+            bell = page.locator(
+                '[aria-label*="notificacion" i], [aria-label*="notification" i], .notification-bell'
+            ).first
+            if bell.is_visible(timeout=500):
+                bell.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(REPORT_POLL_INTERVAL_MS)
+
+    raise TimeoutError(
+        f"El reporte no estuvo listo dentro de {REPORT_WAIT_TIMEOUT_MS / 1000:.0f}s."
+    )
+
+
+def _save_download(dl: Download) -> Path:
+    suggested = dl.suggested_filename or "export.xlsx"
+    target = DOWNLOAD_DIR / f"{int(time.time())}_{suggested}"
+    dl.save_as(target)
+    log(f"Archivo descargado: {target}")
+    return target
+
+
+def _list_bandeja_reports(downloads_dir: Path) -> set[str]:
+    """Devuelve los nombres de archivos tipo Reporte_BandejaDeEntrada_*.csv
+    que ya existen en ~/Downloads (para comparar 'antes/después')."""
+    if not downloads_dir.exists():
+        return set()
+    return {f.name for f in downloads_dir.glob("Reporte_BandejaDeEntrada_*")}
+
+
+def _find_new_bandeja_report(
+    downloads_dir: Path, existing: set[str], min_mtime: float
+) -> Optional[Path]:
+    """Busca un archivo Reporte_BandejaDeEntrada_* que NO esté en `existing`
+    y cuya fecha de modificación sea >= min_mtime (para no agarrar uno viejo)."""
+    if not downloads_dir.exists():
+        return None
+    candidates = [
+        f for f in downloads_dir.glob("Reporte_BandejaDeEntrada_*")
+        if f.name not in existing and f.stat().st_mtime >= min_mtime
+    ]
+    if not candidates:
+        return None
+    # Si hay varios (raro), tomamos el más reciente.
+    candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _first_visible(page: Page, factories, timeout_ms: int = 15000):
+    """Devuelve el primer locator que esté visible, probando varias estrategias."""
+    last_err: Optional[Exception] = None
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for factory in factories:
+            try:
+                loc = factory().first
+                loc.wait_for(state="visible", timeout=500)
+                return loc
+            except Exception as e:
+                last_err = e
+                continue
+        page.wait_for_timeout(250)
+    raise PlaywrightTimeoutError(
+        f"Ningún selector fue visible en {timeout_ms}ms. Último error: {last_err}"
+    )
+
+
+def _run_once() -> Path:
+    """Una pasada completa: conecta al browser, loguea si hace falta, filtra,
+    exporta y descarga."""
+    with sync_playwright() as p:
+        if BROWSER_MODE == "cdp":
+            context, cleanup = _connect_cdp(p)
+        else:
+            context, cleanup = _launch_persistent(p)
+
+        page = context.pages[0] if context.pages else context.new_page()
+
+        # Listener global de descargas. Lo seteamos ANTES de cualquier click
+        # de exportar para no perder una descarga que dispara inmediatamente.
+        captured_downloads: list[Download] = []
+        page.on("download", lambda dl: captured_downloads.append(dl))
+
+        try:
+            # Fast path: si ya estamos en la bandeja con Exportar visible,
+            # no hacemos login ni navegación (fundamental en modo CDP, donde
+            # la usuaria ya tiene todo listo).
+            if _detect_bandeja(page, timeout_s=3.0):
+                log("✓ Ya estoy en la bandeja — skippeando login y navegación.")
+            else:
+                login(page)
+                go_to_bandeja(page)
+            apply_filter_abierto_and_search(page)
+            export_all_fields(page)
+            path = wait_for_report_and_download(page, captured_downloads)
+            return path
+        finally:
+            if KEEP_OPEN:
+                log("KEEP_OPEN=1 — dejando el browser abierto.")
+                try:
+                    page.pause()
+                except Exception:
+                    pass
+            cleanup()
+
+
+def _connect_cdp(p):
+    """Se conecta a un Chrome ya corriendo con --remote-debugging-port."""
+    log(f"Conectando por CDP a {CDP_URL}…")
+    try:
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+    except Exception as e:
+        raise RuntimeError(
+            f"No pude conectar a {CDP_URL}. ¿Abriste Chrome con "
+            f"--remote-debugging-port=9222? (ver README). Error: {e}"
+        )
+    if not browser.contexts:
+        raise RuntimeError("El Chrome al que conectaste no tiene contextos activos.")
+    context = browser.contexts[0]
+    log(f"✓ Conectado. {len(context.pages)} pestaña(s) abierta(s).")
+
+    def cleanup():
+        # NO cerramos Chrome — es el browser de la usuaria. Solo desconectamos.
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+    return context, cleanup
+
+
+def _launch_persistent(p):
+    """Lanza un Chrome propio con user_data_dir (modo legacy, no-CDP)."""
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    launch_kwargs = dict(
+        user_data_dir=str(USER_DATA_DIR),
+        headless=HEADLESS,
+        slow_mo=SLOW_MO,
+        accept_downloads=True,
+        viewport={"width": 1280, "height": 900},
+        user_agent=USER_AGENT,
+        ignore_default_args=[
+            "--enable-automation",
+            "--enable-blink-features=IdleDetection",
+            "--no-sandbox",
+        ],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-session-crashed-bubble",
+            "--disable-infobars",
+        ],
+    )
+    if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
+        launch_kwargs["channel"] = BROWSER_CHANNEL
+    context = p.chromium.launch_persistent_context(**launch_kwargs)
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
+
+    # Si hay cookies inyectadas (vía BA_SESSION_JSON), las cargamos para
+    # evitar el form de login en CI.
+    if BA_SESSION_JSON:
+        try:
+            cookies = json.loads(BA_SESSION_JSON)
+            # Playwright requiere algunos campos. Aseguramos defaults.
+            for c in cookies:
+                c.setdefault("path", "/")
+                c.setdefault("sameSite", "Lax")
+            context.add_cookies(cookies)
+            log(f"✓ Cargadas {len(cookies)} cookies pre-autenticadas.")
+        except Exception as e:
+            log(f"⚠️  Falló cargar BA_SESSION_JSON: {e}")
+
+    def cleanup():
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    return context, cleanup
+
+
+def download_tickets() -> Path:
+    """Corre el scraper con reintentos. Si todos los intentos fallan,
+    manda un mail de alerta y re-raisea la excepción original."""
+    if not BA_USER or not BA_PASSWORD:
+        raise RuntimeError(
+            "Faltan BA_USER / BA_PASSWORD. Definilos en .env o como variables de entorno."
+        )
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
+        try:
+            return _run_once()
+        except Exception as e:
+            last_exc = e
+            log(f"Intento {attempt} falló: {e!r}")
+            if attempt < MAX_ATTEMPTS:
+                # Pausa progresiva entre reintentos.
+                pause = 5 * attempt
+                log(f"Esperando {pause}s antes de reintentar…")
+                time.sleep(pause)
+
+    # Llegamos acá solo si todos los intentos fallaron.
+    notify.send_failure_alert(
+        subject="[BA Colaborativa] Scraper falló después de reintentos",
+        body=(
+            f"El scraper no pudo descargar los tickets después de "
+            f"{MAX_ATTEMPTS} intentos.\n\n"
+            f"Último error: {last_exc!r}"
+        ),
+        exc=last_exc,
+    )
+    assert last_exc is not None
+    raise last_exc
+
+
+if __name__ == "__main__":
+    try:
+        out = download_tickets()
+    except Exception as e:
+        log(f"ERROR final: {e}")
+        sys.exit(1)
+    log(f"OK — {out}")

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+credentials.json
+downloads/
+*.xlsx
+*.csv
+.DS_Store
+.playwright/
+.playwright-user-data/
+session.json

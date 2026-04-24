@@ -1,0 +1,81 @@
+name: Bajada diaria de tickets BA Colaborativa
+
+on:
+  # 11:00 UTC = 8:00 Argentina (UTC-3)
+  schedule:
+    - cron: "0 11 * * *"
+  # También permite disparar a mano desde la UI de GitHub Actions.
+  workflow_dispatch:
+
+jobs:
+  download-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Credenciales de BA Colaborativa (fallback si las cookies expiraron).
+      BA_USER: ${{ secrets.BA_USER }}
+      BA_PASSWORD: ${{ secrets.BA_PASSWORD }}
+
+      # Cookies pre-autenticadas extraídas con scripts/dump_cookies.py.
+      # Saltean el login del SPA. Cuando expiren (típico días/semanas),
+      # alguien del equipo refresca con el runbook del README.
+      BA_SESSION_JSON: ${{ secrets.BA_SESSION_JSON }}
+
+      # Google Sheets
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      SHEET_TAB: ${{ vars.SHEET_TAB || 'Tickets - General' }}
+      GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      # En CI corremos con Chrome real (channel=chrome) en modo persistente,
+      # con cookies inyectadas. Sin login manual.
+      HEADLESS: "true"
+      BROWSER_MODE: persistent
+      BROWSER_CHANNEL: chrome
+      LOGIN_MODE: auto
+      MAX_ATTEMPTS: "2"
+      SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
+
+      # Notificación por mail en caso de fallo
+      ALERT_TO_EMAIL: julieta.carmona@educabot.com
+      # Configurar uno de los dos backends:
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      # SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      # SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      # SMTP_USER: ${{ secrets.SMTP_USER }}
+      # SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Google Chrome (canal "chrome" para channel=chrome)
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Playwright browsers + system deps
+        run: python -m playwright install --with-deps chromium chrome
+
+      - name: Run pipeline
+        run: python main.py
+
+      - name: Upload exported file as artifact (on failure for debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-dumps
+          path: downloads/
+          if-no-files-found: ignore
