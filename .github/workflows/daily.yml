@@ -27,9 +27,10 @@ jobs:
       SHEET_TAB: ${{ vars.SHEET_TAB || 'Tickets - General' }}
       GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
-      # En CI corremos con Chrome real (channel=chrome) en modo persistente,
-      # con cookies inyectadas. Sin login manual.
-      HEADLESS: "true"
+      # En CI corremos con Chrome real (channel=chrome), modo persistente,
+      # cookies inyectadas y display virtual (xvfb). HEADLESS=false porque
+      # muchas apps detectan headless explícitamente.
+      HEADLESS: "false"
       BROWSER_MODE: persistent
       BROWSER_CHANNEL: chrome
       LOGIN_MODE: auto
@@ -69,8 +70,11 @@ jobs:
       - name: Install Playwright browsers + system deps
         run: python -m playwright install --with-deps chromium chrome
 
-      - name: Run pipeline
-        run: python main.py
+      - name: Install Xvfb (display virtual para correr headed)
+        run: sudo apt-get install -y xvfb
+
+      - name: Run pipeline (headed bajo Xvfb)
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" python main.py
 
       - name: Upload exported file as artifact (on failure for debug)
         if: failure()

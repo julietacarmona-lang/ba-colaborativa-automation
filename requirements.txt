@@ -1,4 +1,5 @@
 playwright==1.47.0
+tf-playwright-stealth==1.1.2
 gspread==6.1.2
 google-auth==2.34.0
 pandas==2.2.2

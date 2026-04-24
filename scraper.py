@@ -804,6 +804,16 @@ def _launch_persistent(p):
         "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
     )
 
+    # Stealth: parchea ~30 señales que las apps usan para detectar Playwright.
+    try:
+        from playwright_stealth import stealth_sync
+        for pg in context.pages:
+            stealth_sync(pg)
+        context.on("page", lambda pg: stealth_sync(pg))
+        log("✓ Stealth aplicado al contexto.")
+    except Exception as e:
+        log(f"(stealth no aplicado: {e})")
+
     # Si hay cookies inyectadas (vía BA_SESSION_JSON), las cargamos para
     # evitar el form de login en CI.
     if BA_SESSION_JSON:
