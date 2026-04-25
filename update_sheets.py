@@ -86,11 +86,24 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> dict:
         _build_row(row, headers) for _, row in new_df.iterrows()
     ]
 
-    log(f"Appendeando {len(rows_to_append)} filas al Sheets…")
-    ws.append_rows(
+    # Calculamos la primera fila libre DESPUÉS de la última fila con dato en
+    # la columna 'Número' (en lugar de usar append_rows, que usa el final del
+    # worksheet — eso deja gaps si hay filas vacías reservadas).
+    numero_values = ws.col_values(numero_col_idx)
+    last_data_row = 0
+    for i, v in enumerate(numero_values, start=1):
+        if v and v.strip():
+            last_data_row = i
+    next_row = last_data_row + 1
+    end_row = next_row + len(rows_to_append) - 1
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(headers)).rstrip("1")
+    range_str = f"A{next_row}:{last_col_letter}{end_row}"
+
+    log(f"Insertando {len(rows_to_append)} filas en {range_str}…")
+    ws.update(
+        range_str,
         rows_to_append,
         value_input_option="USER_ENTERED",
-        insert_data_option="INSERT_ROWS",
     )
     log("✓ Listo.")
     return stats

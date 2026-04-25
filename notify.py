@@ -29,6 +29,12 @@ import json
 
 ALERT_TO = os.environ.get("ALERT_TO_EMAIL", "julieta.carmona@educabot.com")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# Link al Sheets — se incluye al final de cada mensaje de Slack.
+SHEET_LINK = os.environ.get("SHEET_LINK", "").strip()
+
+
+def _with_sheet_link(text: str) -> str:
+    return f"{text}\n<{SHEET_LINK}|Abrir Sheets>" if SHEET_LINK else text
 
 
 def send_slack(text: str) -> None:
@@ -58,7 +64,7 @@ def send_success_message(added: int, total_in_export: int) -> None:
         text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos* (export tenía {total_in_export} ya cargados)."
     else:
         text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets (export tenía {total_in_export})."
-    send_slack(text)
+    send_slack(_with_sheet_link(text))
 
 
 def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = None) -> None:
@@ -70,7 +76,7 @@ def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = N
 
     # Notificar a Slack si está configurado.
     short_err = str(exc)[:200] if exc else "ver mail/logs"
-    send_slack(f"❌ BA Colaborativa: *{subject}*\n```{short_err}```")
+    send_slack(_with_sheet_link(f"❌ BA Colaborativa: *{subject}*\n```{short_err}```"))
 
     # Backend 1: Resend (si hay API key)
     if os.environ.get("RESEND_API_KEY"):

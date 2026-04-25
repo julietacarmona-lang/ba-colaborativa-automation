@@ -1,9 +1,9 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # 11:00 UTC = 8:00 Argentina (UTC-3)
+  # 11:00 UTC = 8:00 Argentina (UTC-3). Lunes a viernes (1-5), sin fin de semana.
   schedule:
-    - cron: "0 11 * * *"
+    - cron: "0 11 * * 1-5"
   # También permite disparar a mano desde la UI de GitHub Actions.
   workflow_dispatch:
 
@@ -44,6 +44,8 @@ jobs:
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
       # Slack: si se define, manda mensajes de éxito y fallo a un canal.
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Link al Sheets (se incluye al final de cada mensaje de Slack).
+      SHEET_LINK: ${{ vars.SHEET_LINK }}
       # SMTP_HOST: ${{ secrets.SMTP_HOST }}
       # SMTP_PORT: ${{ secrets.SMTP_PORT }}
       # SMTP_USER: ${{ secrets.SMTP_USER }}
