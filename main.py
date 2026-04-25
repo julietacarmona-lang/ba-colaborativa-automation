@@ -28,7 +28,7 @@ def log(msg: str) -> None:
     print(f"[main] {msg}", flush=True)
 
 
-def run() -> int:
+def run() -> dict:
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
     if not spreadsheet_id:
         raise RuntimeError("Falta SPREADSHEET_ID en .env / variables de entorno.")
@@ -38,22 +38,24 @@ def run() -> int:
     log(f"Export: {export_path}")
 
     log("2/2 — Mergeando contra Google Sheets…")
-    added = update_sheets.update_sheets(export_path, spreadsheet_id)
-    log(f"✓ {added} tickets nuevos agregados.")
-    return added
+    stats = update_sheets.update_sheets(export_path, spreadsheet_id)
+    log(f"✓ {stats['added']} tickets nuevos agregados (export: {stats['export_total']}).")
+    return stats
 
 
 if __name__ == "__main__":
     try:
-        added = run()
+        stats = run()
     except Exception as e:
         log(f"ERROR: {e}")
-        # El scraper ya manda su propio mail de alerta si falla. Acá mandamos
-        # mail para fallos del update_sheets (o cualquier otra cosa después del scraper).
         notify.send_failure_alert(
             subject="[BA Colaborativa] Pipeline falló",
             body=f"El orquestador falló con: {e!r}",
             exc=e,
         )
         sys.exit(1)
-    log(f"Pipeline OK. Total agregados: {added}")
+    log(f"Pipeline OK. Total agregados: {stats['added']}")
+    notify.send_success_message(
+        added=stats["added"],
+        total_in_export=stats["export_total"],
+    )

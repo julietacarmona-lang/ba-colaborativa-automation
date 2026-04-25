@@ -39,9 +39,11 @@ jobs:
 
       # Notificación por mail en caso de fallo
       ALERT_TO_EMAIL: julieta.carmona@educabot.com
-      # Configurar uno de los dos backends:
+      # Configurar uno de los dos backends de mail:
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      # Slack: si se define, manda mensajes de éxito y fallo a un canal.
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       # SMTP_HOST: ${{ secrets.SMTP_HOST }}
       # SMTP_PORT: ${{ secrets.SMTP_PORT }}
       # SMTP_USER: ${{ secrets.SMTP_USER }}

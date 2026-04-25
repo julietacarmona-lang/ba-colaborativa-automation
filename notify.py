@@ -28,6 +28,37 @@ import urllib.request
 import json
 
 ALERT_TO = os.environ.get("ALERT_TO_EMAIL", "julieta.carmona@educabot.com")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+
+
+def send_slack(text: str) -> None:
+    """Manda un mensaje a Slack via incoming webhook. Si no hay webhook, no hace nada."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        payload = json.dumps({"text": text}).encode("utf-8")
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status >= 300:
+                print(f"[notify] Slack respondió {resp.status}: {resp.read()!r}")
+            else:
+                print(f"[notify] Slack OK")
+    except Exception as e:
+        print(f"[notify] Slack falló: {e}")
+
+
+def send_success_message(added: int, total_in_export: int) -> None:
+    """Notifica a Slack que el pipeline terminó OK."""
+    if added == 0:
+        text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos* (export tenía {total_in_export} ya cargados)."
+    else:
+        text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets (export tenía {total_in_export})."
+    send_slack(text)
 
 
 def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = None) -> None:
@@ -36,6 +67,10 @@ def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = N
     if exc is not None:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         full_body = f"{body}\n\n--- Traceback ---\n{tb}"
+
+    # Notificar a Slack si está configurado.
+    short_err = str(exc)[:200] if exc else "ver mail/logs"
+    send_slack(f"❌ BA Colaborativa: *{subject}*\n```{short_err}```")
 
     # Backend 1: Resend (si hay API key)
     if os.environ.get("RESEND_API_KEY"):

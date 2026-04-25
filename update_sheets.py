@@ -36,9 +36,9 @@ def log(msg: str) -> None:
     print(f"[sheets] {msg}", flush=True)
 
 
-def update_sheets(export_path: Path, spreadsheet_id: str) -> int:
+def update_sheets(export_path: Path, spreadsheet_id: str) -> dict:
     """Carga el export, compara contra el Sheets y appendea nuevos.
-    Devuelve la cantidad de filas agregadas."""
+    Devuelve un dict con stats: {'export_total', 'existing', 'added'}."""
     log(f"Leyendo export: {export_path}")
     df_export = _read_export(export_path)
     log(f"  {len(df_export)} filas en el export.")
@@ -74,8 +74,13 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> int:
     new_df = df_export[~df_export[NUMBER_COL].isin(existing_numbers)]
     log(f"  {len(new_df)} tickets nuevos para agregar.")
 
+    stats = {
+        "export_total": len(df_export),
+        "existing": len(existing_numbers),
+        "added": len(new_df),
+    }
     if len(new_df) == 0:
-        return 0
+        return stats
 
     rows_to_append = [
         _build_row(row, headers) for _, row in new_df.iterrows()
@@ -88,7 +93,7 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> int:
         insert_data_option="INSERT_ROWS",
     )
     log("✓ Listo.")
-    return len(rows_to_append)
+    return stats
 
 
 def _read_export(path: Path) -> pd.DataFrame:
@@ -177,5 +182,5 @@ if __name__ == "__main__":
         print("ERROR: falta SPREADSHEET_ID en .env")
         sys.exit(1)
 
-    added = update_sheets(Path(sys.argv[1]), spreadsheet_id)
-    print(f"OK — {added} tickets agregados.")
+    stats = update_sheets(Path(sys.argv[1]), spreadsheet_id)
+    print(f"OK — {stats['added']} tickets agregados (export: {stats['export_total']}, existentes: {stats['existing']}).")
