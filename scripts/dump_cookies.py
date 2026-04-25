@@ -1,13 +1,15 @@
-"""Extrae cookies de la sesión activa en el Chrome CDP local y las guarda
-en session.json para usarlas en GitHub Actions.
+"""Extrae el ESTADO COMPLETO de la sesión activa (cookies + localStorage +
+sessionStorage) en el Chrome CDP local, y lo guarda en session.json para
+usarlo en GitHub Actions.
 
 Uso:
   1. Tener corriendo ./scripts/chrome-cdp.sh con sesión activa de BA Colaborativa.
-  2. Correr: .venv/bin/python scripts/dump_cookies.py
-  3. Subir el contenido de session.json como secret BA_SESSION_JSON en GitHub.
+  2. Tener una pestaña abierta en la bandeja (importante: el localStorage del
+     SPA se llena solo cuando pasaste por la app).
+  3. Correr: .venv/bin/python scripts/dump_cookies.py
+  4. Subir el contenido de session.json como secret BA_SESSION_JSON en GitHub.
 
-Las cookies expiran cada cierto tiempo (típicamente días/semanas). Cuando el
-workflow falle por sesión expirada, repetir este proceso.
+Las cookies/JWT expiran. Cuando el workflow falle, repetir este proceso.
 """
 
 from __future__ import annotations
@@ -47,30 +49,75 @@ def main() -> int:
             return 1
 
         context = browser.contexts[0]
+
+        # 1. Cookies (filtradas a dominios relevantes)
         all_cookies = context.cookies()
-        relevant = [
+        cookies = [
             c for c in all_cookies
             if any(d in c.get("domain", "") for d in RELEVANT_DOMAINS)
         ]
-        if not relevant:
+
+        # 2. localStorage + sessionStorage de cada página relevante.
+        origins = []
+        for page in context.pages:
+            url = page.url
+            if not any(d in url for d in RELEVANT_DOMAINS):
+                continue
+            try:
+                origin = page.evaluate("() => window.location.origin")
+                local = page.evaluate("""() => {
+                    const out = [];
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        out.push({name: k, value: localStorage.getItem(k)});
+                    }
+                    return out;
+                }""")
+                session = page.evaluate("""() => {
+                    const out = [];
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const k = sessionStorage.key(i);
+                        out.push({name: k, value: sessionStorage.getItem(k)});
+                    }
+                    return out;
+                }""")
+                if local or session:
+                    origins.append({
+                        "origin": origin,
+                        "localStorage": local,
+                        "sessionStorage": session,
+                    })
+            except Exception as e:
+                print(f"(no pude leer storage de {url[:60]}: {e})", file=sys.stderr)
+
+        if not cookies and not origins:
             print(
-                "⚠️  No encontré cookies de BA Colaborativa. ¿Estás logueada "
-                "en el Chrome CDP?",
+                "⚠️  No encontré sesión de BA Colaborativa. ¿Estás logueada "
+                "y con la bandeja abierta en el Chrome CDP?",
                 file=sys.stderr,
             )
             return 1
 
-        OUT_FILE.write_text(json.dumps(relevant, indent=2, ensure_ascii=False))
-        print(f"✓ Guardadas {len(relevant)} cookies en {OUT_FILE.resolve()}")
+        # Formato Playwright storage_state — compatible con context.storage_state.
+        state = {"cookies": cookies, "origins": origins}
+        OUT_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+
+        local_total = sum(len(o["localStorage"]) for o in origins)
+        session_total = sum(len(o["sessionStorage"]) for o in origins)
+        print(f"✓ Estado guardado en {OUT_FILE.resolve()}")
+        print(f"  - {len(cookies)} cookies")
+        print(f"  - {len(origins)} orígenes con storage")
+        print(f"    · {local_total} entradas en localStorage")
+        print(f"    · {session_total} entradas en sessionStorage")
         print()
         print("Próximos pasos:")
-        print("  1. Abrí GitHub → repo → Settings → Secrets and variables → Actions")
+        print("  1. GitHub → repo → Settings → Secrets and variables → Actions")
         print("  2. Editá (o creá) el secret 'BA_SESSION_JSON'")
         print("  3. Pegá el contenido completo del archivo session.json")
         print("  4. Save")
         print()
-        print(f"⚠️  IMPORTANTE: {OUT_FILE} contiene cookies de sesión sensibles.")
-        print(f"   Está en .gitignore, NO la subas al repo. Borrala cuando termines.")
+        print(f"⚠️  IMPORTANTE: {OUT_FILE} contiene cookies y JWTs sensibles.")
+        print(f"   Está en .gitignore. Borrala cuando termines.")
 
         browser.close()
         return 0

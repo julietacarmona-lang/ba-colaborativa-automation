@@ -815,11 +815,43 @@ def _connect_cdp(p):
 
 
 def _launch_persistent(p):
-    """Lanza un Chrome propio con user_data_dir (modo legacy, no-CDP).
+    """Lanza un Chrome (modo CI). Si hay BA_SESSION_JSON, usa
+    new_context(storage_state=...) que carga cookies + localStorage. Si no,
+    cae a launch_persistent_context."""
+    if BA_SESSION_JSON:
+        # Modo CI: browser fresh + context con storage_state inyectado.
+        # Esto incluye cookies + localStorage + sessionStorage del estado
+        # capturado (vital para que el SPA tenga el JWT que el backend espera).
+        launch_kwargs = dict(headless=HEADLESS, slow_mo=SLOW_MO)
+        if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
+            launch_kwargs["channel"] = BROWSER_CHANNEL
+        browser = p.chromium.launch(**launch_kwargs)
+        try:
+            storage_state = json.loads(BA_SESSION_JSON)
+        except Exception as e:
+            log(f"⚠️  BA_SESSION_JSON inválido: {e}. Cayendo a contexto vacío.")
+            storage_state = None
 
-    Config minimal — sin stealth, sin init scripts, sin ignore_default_args.
-    Probamos si Angular bootea con la config "vanilla" de Playwright.
-    """
+        context = browser.new_context(
+            storage_state=storage_state,
+            accept_downloads=True,
+            viewport={"width": 1280, "height": 900},
+        )
+        if storage_state:
+            n_cookies = len(storage_state.get("cookies", []))
+            n_origins = len(storage_state.get("origins", []))
+            log(f"✓ Storage state cargado: {n_cookies} cookies, {n_origins} orígenes (con localStorage).")
+
+        def cleanup():
+            try:
+                context.close()
+                browser.close()
+            except Exception:
+                pass
+
+        return context, cleanup
+
+    # Modo local sin sesión inyectada: persistent context.
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     launch_kwargs = dict(
         user_data_dir=str(USER_DATA_DIR),
@@ -831,20 +863,6 @@ def _launch_persistent(p):
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
         launch_kwargs["channel"] = BROWSER_CHANNEL
     context = p.chromium.launch_persistent_context(**launch_kwargs)
-
-    # Si hay cookies inyectadas (vía BA_SESSION_JSON), las cargamos para
-    # evitar el form de login en CI.
-    if BA_SESSION_JSON:
-        try:
-            cookies = json.loads(BA_SESSION_JSON)
-            # Playwright requiere algunos campos. Aseguramos defaults.
-            for c in cookies:
-                c.setdefault("path", "/")
-                c.setdefault("sameSite", "Lax")
-            context.add_cookies(cookies)
-            log(f"✓ Cargadas {len(cookies)} cookies pre-autenticadas.")
-        except Exception as e:
-            log(f"⚠️  Falló cargar BA_SESSION_JSON: {e}")
 
     def cleanup():
         try:
