@@ -778,6 +778,19 @@ def _run_once() -> Path:
             apply_filter_abierto_and_search(page)
             export_all_fields(page)
             path = wait_for_report_and_download(page, captured_downloads)
+
+            # Antes de cerrar el browser, dumpeamos el storage state actual.
+            # Estas cookies fueron renovadas por Keycloak durante esta corrida,
+            # así que extienden la vida de la sesión. El workflow las sube
+            # como secret nuevo después.
+            try:
+                refreshed = DOWNLOAD_DIR / "session_refreshed.json"
+                refreshed.parent.mkdir(parents=True, exist_ok=True)
+                context.storage_state(path=str(refreshed))
+                log(f"✓ Storage state refrescado guardado en {refreshed.name}")
+            except Exception as e:
+                log(f"(no pude dumpear storage refrescado: {e})")
+
             return path
         finally:
             if KEEP_OPEN:

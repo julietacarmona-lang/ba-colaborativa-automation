@@ -1,10 +1,11 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # 11:00 UTC = 8:00 Argentina (UTC-3). Lunes a viernes (1-5), sin fin de semana.
+  # Todos los días a las 11:00 UTC (8:00 Argentina). Incluye sábado y domingo
+  # — corre igual aunque no haya tickets nuevos, así la sesión de Keycloak
+  # no expira por inactividad durante el fin de semana.
   schedule:
-    - cron: "0 11 * * 1-5"
-  # También permite disparar a mano desde la UI de GitHub Actions.
+    - cron: "0 11 * * *"
   workflow_dispatch:
 
 jobs:
@@ -79,6 +80,23 @@ jobs:
 
       - name: Run pipeline (headed bajo Xvfb)
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" python main.py
+
+      - name: Refrescar BA_SESSION_JSON con cookies renovadas
+        # Solo si la corrida fue OK y el scraper dejó session_refreshed.json.
+        # Esto extiende la vida de la sesión: las cookies que Keycloak renovó
+        # durante esta corrida quedan guardadas para la siguiente.
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f downloads/session_refreshed.json ] && [ -n "$GH_TOKEN" ]; then
+            gh secret set BA_SESSION_JSON \
+              --body "$(cat downloads/session_refreshed.json)" \
+              --repo ${{ github.repository }}
+            echo "✓ Secret BA_SESSION_JSON actualizado con cookies frescas."
+          else
+            echo "(no actualizo secret — falta el archivo o GH_PAT no configurado)"
+          fi
 
       - name: Upload exported file as artifact (on failure for debug)
         if: failure()
