@@ -67,6 +67,23 @@ def send_success_message(added: int, total_in_export: int) -> None:
     send_slack(_with_sheet_link(text))
 
 
+REFRESH_HINT_KEYWORDS = (
+    "captcha",
+    "form de login",
+    "se acabó el tiempo",
+    "auth/logout",
+    "401",
+    "contactos",
+)
+
+
+def _is_session_expired(exc: Optional[BaseException], body: str) -> bool:
+    """Heurística para distinguir 'sesión expirada' de 'otro error'.
+    Si lo es, el mensaje de Slack incluye el comando exacto para refrescar."""
+    text = (str(exc or "") + " " + body).lower()
+    return any(k in text for k in REFRESH_HINT_KEYWORDS)
+
+
 def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = None) -> None:
     """Mandá una alerta con `subject` y `body`. Si `exc` está, appendea el traceback."""
     full_body = body
@@ -76,7 +93,16 @@ def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = N
 
     # Notificar a Slack si está configurado.
     short_err = str(exc)[:200] if exc else "ver mail/logs"
-    send_slack(_with_sheet_link(f"❌ BA Colaborativa: *{subject}*\n```{short_err}```"))
+    if _is_session_expired(exc, body):
+        msg = (
+            "⚠️ *BA Colaborativa: sesión expirada* — el SPA pidió relogin "
+            "y Keycloak mostró captcha. Hay que refrescar las cookies.\n\n"
+            "*Para arreglarlo* (3 min): abrí terminal en la carpeta del proyecto y corré:\n"
+            "```./scripts/refresh-session.sh```"
+        )
+    else:
+        msg = f"❌ BA Colaborativa: *{subject}*\n```{short_err}```"
+    send_slack(_with_sheet_link(msg))
 
     # Backend 1: Resend (si hay API key)
     if os.environ.get("RESEND_API_KEY"):
