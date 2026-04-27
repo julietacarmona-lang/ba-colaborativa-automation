@@ -61,9 +61,9 @@ def send_slack(text: str) -> None:
 def send_success_message(added: int, total_in_export: int) -> None:
     """Notifica a Slack que el pipeline terminó OK."""
     if added == 0:
-        text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos* (export tenía {total_in_export} ya cargados)."
+        text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos*. Hay {total_in_export} abiertos actualmente."
     else:
-        text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets (export tenía {total_in_export})."
+        text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
     send_slack(_with_sheet_link(text))
 
 
