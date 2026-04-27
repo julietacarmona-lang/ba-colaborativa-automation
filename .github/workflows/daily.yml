@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: "0 11 * * *"
   workflow_dispatch:
+    inputs:
+      skip_slack:
+        description: "No mandar mensaje a Slack (útil para pruebas)"
+        type: boolean
+        default: false
 
 jobs:
   download-and-sync:
@@ -44,7 +49,8 @@ jobs:
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
       # Slack: si se define, manda mensajes de éxito y fallo a un canal.
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Cuando se dispara con `skip_slack=true`, no manda nada (útil para pruebas).
+      SLACK_WEBHOOK_URL: ${{ inputs.skip_slack && '' || secrets.SLACK_WEBHOOK_URL }}
       # Link al Sheets (se incluye al final de cada mensaje de Slack).
       SHEET_LINK: ${{ vars.SHEET_LINK }}
       # SMTP_HOST: ${{ secrets.SMTP_HOST }}
