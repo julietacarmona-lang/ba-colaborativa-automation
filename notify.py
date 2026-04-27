@@ -38,8 +38,9 @@ def _with_sheet_link(text: str) -> str:
 
 
 def send_slack(text: str) -> None:
-    """Manda un mensaje a Slack via incoming webhook. Si no hay webhook, no hace nada."""
-    if not SLACK_WEBHOOK_URL:
+    """Manda un mensaje a Slack via incoming webhook. Si no hay webhook o se
+    seteó SKIP_SLACK=1, no hace nada."""
+    if not SLACK_WEBHOOK_URL or os.environ.get("SKIP_SLACK", "").strip() in ("1", "true", "yes"):
         return
     try:
         payload = json.dumps({"text": text}).encode("utf-8")
