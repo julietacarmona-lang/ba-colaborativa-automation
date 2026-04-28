@@ -41,13 +41,24 @@ def _with_sheet_link(text: str) -> str:
     return f"{text}\n<{SHEET_LINK}|Abrir Sheets>" if SHEET_LINK else text
 
 
-def _send_slack_to(webhook_url: str, text: str, label: str) -> None:
-    """Manda un mensaje a un webhook de Slack puntual. Respeta SKIP_SLACK=1
-    (lo silencia para pruebas manuales)."""
+BOT_NAME = "BA Colaborativa Bot"
+SUCCESS_EMOJI = ":inbox_tray:"  # bandeja
+ERROR_EMOJI = ":rotating_light:"  # luz de alerta
+
+
+def _send_slack_to(
+    webhook_url: str, text: str, label: str, username: str, icon_emoji: str
+) -> None:
+    """Manda un mensaje a un webhook de Slack puntual con nombre e ícono
+    customizados. Respeta SKIP_SLACK=1."""
     if not webhook_url or os.environ.get("SKIP_SLACK", "").strip() in ("1", "true", "yes"):
         return
     try:
-        payload = json.dumps({"text": text}).encode("utf-8")
+        payload = json.dumps({
+            "text": text,
+            "username": username,
+            "icon_emoji": icon_emoji,
+        }).encode("utf-8")
         req = urllib.request.Request(
             webhook_url,
             data=payload,
@@ -64,15 +75,24 @@ def _send_slack_to(webhook_url: str, text: str, label: str) -> None:
 
 
 def send_slack(text: str) -> None:
-    """Manda un mensaje al webhook de éxitos (canal del equipo)."""
-    _send_slack_to(SLACK_WEBHOOK_URL, text, label="success")
+    """Mensaje al canal del equipo (éxitos). Bot 'BA Colaborativa Bot' con bandeja."""
+    _send_slack_to(
+        SLACK_WEBHOOK_URL, text,
+        label="success",
+        username=BOT_NAME,
+        icon_emoji=SUCCESS_EMOJI,
+    )
 
 
 def send_slack_error(text: str) -> None:
-    """Manda un mensaje al webhook de errores (canal privado del owner).
-    Si SLACK_WEBHOOK_URL_ERROR no está definido, no hace nada — el error
-    queda solo en logs de GitHub Actions."""
-    _send_slack_to(SLACK_WEBHOOK_URL_ERROR, text, label="error")
+    """Mensaje al canal privado del owner (errores). Mismo bot, ícono de alerta.
+    Si no hay webhook de error configurado, no se manda nada."""
+    _send_slack_to(
+        SLACK_WEBHOOK_URL_ERROR, text,
+        label="error",
+        username=BOT_NAME,
+        icon_emoji=ERROR_EMOJI,
+    )
 
 
 def send_success_message(added: int, total_in_export: int) -> None:
