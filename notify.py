@@ -42,8 +42,8 @@ def _with_sheet_link(text: str) -> str:
 
 
 BOT_NAME = "BA Colaborativa Bot"
-SUCCESS_EMOJI = ":inbox_tray:"  # bandeja
-ERROR_EMOJI = ":rotating_light:"  # luz de alerta
+SUCCESS_EMOJI = ":tada:"  # 🎉
+ERROR_EMOJI = ":rotating_light:"  # 🚨
 
 
 def _send_slack_to(
