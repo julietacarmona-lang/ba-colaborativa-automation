@@ -28,7 +28,11 @@ import urllib.request
 import json
 
 ALERT_TO = os.environ.get("ALERT_TO_EMAIL", "julieta.carmona@educabot.com")
+# Webhook para mensajes de éxito (canal compartido del equipo).
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# Webhook para mensajes de error (idealmente un canal privado solo del owner).
+# Si está vacío, los errores NO se mandan a Slack (solo quedan en logs/mail).
+SLACK_WEBHOOK_URL_ERROR = os.environ.get("SLACK_WEBHOOK_URL_ERROR", "").strip()
 # Link al Sheets — se incluye al final de cada mensaje de Slack.
 SHEET_LINK = os.environ.get("SHEET_LINK", "").strip()
 
@@ -37,26 +41,38 @@ def _with_sheet_link(text: str) -> str:
     return f"{text}\n<{SHEET_LINK}|Abrir Sheets>" if SHEET_LINK else text
 
 
-def send_slack(text: str) -> None:
-    """Manda un mensaje a Slack via incoming webhook. Si no hay webhook o se
-    seteó SKIP_SLACK=1, no hace nada."""
-    if not SLACK_WEBHOOK_URL or os.environ.get("SKIP_SLACK", "").strip() in ("1", "true", "yes"):
+def _send_slack_to(webhook_url: str, text: str, label: str) -> None:
+    """Manda un mensaje a un webhook de Slack puntual. Respeta SKIP_SLACK=1
+    (lo silencia para pruebas manuales)."""
+    if not webhook_url or os.environ.get("SKIP_SLACK", "").strip() in ("1", "true", "yes"):
         return
     try:
         payload = json.dumps({"text": text}).encode("utf-8")
         req = urllib.request.Request(
-            SLACK_WEBHOOK_URL,
+            webhook_url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status >= 300:
-                print(f"[notify] Slack respondió {resp.status}: {resp.read()!r}")
+                print(f"[notify] Slack {label} respondió {resp.status}: {resp.read()!r}")
             else:
-                print(f"[notify] Slack OK")
+                print(f"[notify] Slack {label} OK")
     except Exception as e:
-        print(f"[notify] Slack falló: {e}")
+        print(f"[notify] Slack {label} falló: {e}")
+
+
+def send_slack(text: str) -> None:
+    """Manda un mensaje al webhook de éxitos (canal del equipo)."""
+    _send_slack_to(SLACK_WEBHOOK_URL, text, label="success")
+
+
+def send_slack_error(text: str) -> None:
+    """Manda un mensaje al webhook de errores (canal privado del owner).
+    Si SLACK_WEBHOOK_URL_ERROR no está definido, no hace nada — el error
+    queda solo en logs de GitHub Actions."""
+    _send_slack_to(SLACK_WEBHOOK_URL_ERROR, text, label="error")
 
 
 def send_success_message(added: int, total_in_export: int) -> None:
@@ -92,7 +108,9 @@ def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = N
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         full_body = f"{body}\n\n--- Traceback ---\n{tb}"
 
-    # Notificar a Slack si está configurado.
+    # Notificar a Slack — al webhook de errores (canal privado del owner),
+    # NO al webhook general del equipo. Si no hay webhook de error configurado,
+    # el mensaje no se manda a ningún lado (queda en logs de GitHub Actions).
     short_err = str(exc)[:200] if exc else "ver mail/logs"
     if _is_session_expired(exc, body):
         msg = (
@@ -103,7 +121,7 @@ def send_failure_alert(subject: str, body: str, exc: Optional[BaseException] = N
         )
     else:
         msg = f"❌ BA Colaborativa: *{subject}*\n```{short_err}```"
-    send_slack(_with_sheet_link(msg))
+    send_slack_error(_with_sheet_link(msg))
 
     # Backend 1: Resend (si hay API key)
     if os.environ.get("RESEND_API_KEY"):
