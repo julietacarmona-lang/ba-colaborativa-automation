@@ -380,7 +380,7 @@ def go_to_bandeja(page: Page) -> None:
         ],
         timeout_ms=15000,
     )
-    contactos.click()
+    contactos.click(force=True)
 
     log("Clickeando 'Bandeja de entrada'…")
     bandeja_item = _first_visible(
@@ -394,7 +394,7 @@ def go_to_bandeja(page: Page) -> None:
         ],
         timeout_ms=5000,
     )
-    bandeja_item.click()
+    bandeja_item.click(force=True)
 
     if not _detect_bandeja(page, timeout_s=30.0):
         raise RuntimeError(
@@ -427,7 +427,7 @@ def apply_filter_abierto_and_search(page: Page) -> None:
                 ],
                 timeout_ms=5000,
             )
-            header.click()
+            header.click(force=True)
             page.wait_for_timeout(800)
         except PlaywrightTimeoutError:
             log("(No encontré el header para expandir — sigo igual.)")
@@ -483,7 +483,7 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
             ],
             timeout_ms=5000,
         )
-        dropdown.click()
+        dropdown.click(force=True)
         page.wait_for_timeout(300)
     except PlaywrightTimeoutError:
         log("(No encontré el dropdown 'Filtros guardados' — omito la carga del filtro.)")
@@ -501,7 +501,7 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
             ],
             timeout_ms=5000,
         )
-        opcion.click()
+        opcion.click(force=True)
         page.wait_for_timeout(400)
     except PlaywrightTimeoutError:
         log(f"⚠️  No encontré la opción '{filter_name}' en el dropdown. ¿Está bien escrito?")
@@ -517,7 +517,7 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
             ],
             timeout_ms=5000,
         )
-        cargar.click()
+        cargar.click(force=True)
         page.wait_for_timeout(600)
         log(f"✓ Filtro '{filter_name}' cargado.")
     except PlaywrightTimeoutError:
