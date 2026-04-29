@@ -447,8 +447,9 @@ def apply_filter_abierto_and_search(page: Page) -> None:
             lambda: page.locator('button:has-text("Buscar")'),
         ],
     )
-    buscar.click()
-    # Esperamos a que la tabla de resultados se pueble + loader desaparezca.
+    # force=True ignora el backdrop de Angular (que intercepta pointer events
+    # cuando hay muchos resultados cargando).
+    buscar.click(force=True)
     page.wait_for_timeout(3000)
     _wait_for_loader_gone(page)
 
@@ -533,7 +534,7 @@ def export_all_fields(page: Page) -> None:
             lambda: page.locator('button:has-text("Exportar")'),
         ],
     )
-    exportar_btn.click()
+    exportar_btn.click(force=True)
 
     log("Esperando modal 'Columnas a exportar'…")
     # El modal puede no tener role=dialog — probamos varias estrategias.
@@ -574,7 +575,7 @@ def export_all_fields(page: Page) -> None:
         ],
         timeout_ms=10000,
     )
-    seleccion.click()
+    seleccion.click(force=True)
     page.wait_for_timeout(400)
 
     log("Seleccionando 'Todos los campos'…")
@@ -591,7 +592,7 @@ def export_all_fields(page: Page) -> None:
         ],
         timeout_ms=10000,
     )
-    todos.click()
+    todos.click(force=True)
     page.wait_for_timeout(400)
 
     log("Confirmando Exportar dentro del modal…")
@@ -603,7 +604,7 @@ def export_all_fields(page: Page) -> None:
             lambda: page.locator('button:has-text("Exportar")').last,
         ],
     )
-    confirmar.click()
+    confirmar.click(force=True)
 
 
 def wait_for_report_and_download(page: Page, captured: list) -> Path:
