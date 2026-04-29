@@ -439,6 +439,7 @@ def apply_filter_abierto_and_search(page: Page) -> None:
         _load_saved_filter(page, SAVED_FILTER_NAME)
 
     log("Click en Buscar…")
+    _wait_for_loader_gone(page)
     buscar = _first_visible(
         page,
         [
@@ -447,7 +448,9 @@ def apply_filter_abierto_and_search(page: Page) -> None:
         ],
     )
     buscar.click()
+    # Esperamos a que la tabla de resultados se pueble + loader desaparezca.
     page.wait_for_timeout(3000)
+    _wait_for_loader_gone(page)
 
 
 def _load_saved_filter(page: Page, filter_name: str) -> None:
@@ -522,6 +525,7 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
 
 def export_all_fields(page: Page) -> None:
     log("Click en Exportar…")
+    _wait_for_loader_gone(page)
     exportar_btn = _first_visible(
         page,
         [
@@ -720,6 +724,24 @@ def _find_new_bandeja_report(
     # Si hay varios (raro), tomamos el más reciente.
     candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     return candidates[0]
+
+
+def _wait_for_loader_gone(page: Page, timeout_ms: int = 30000) -> None:
+    """Espera a que el loader/backdrop de Angular desaparezca. El SPA muestra
+    un <app-loader> con un backdrop full-screen que intercepta los clicks
+    mientras carga datos. Si no esperamos, los clicks fallan con
+    'subtree intercepts pointer events'."""
+    selectors = [
+        "app-loader .backdrop",
+        "app-loader",
+        ".loader-overlay",
+        ".backdrop.full-screen",
+    ]
+    for sel in selectors:
+        try:
+            page.locator(sel).first.wait_for(state="hidden", timeout=timeout_ms)
+        except Exception:
+            pass
 
 
 def _first_visible(page: Page, factories, timeout_ms: int = 15000):
