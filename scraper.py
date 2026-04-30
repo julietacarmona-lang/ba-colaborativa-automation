@@ -400,23 +400,53 @@ def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
     log(f"🤖 Anti-captcha: enviando reCAPTCHA (sitekey {site_key[:12]}…) desde {site_url[:60]}…")
     token = anti_captcha.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
 
-    log("Inyectando token en la página…")
-    # Inyectamos el token en el textarea hidden del widget reCAPTCHA.
-    # También probamos llamar al callback si está definido (algunos widgets
-    # requieren eso para "marcar el captcha como resuelto").
-    page.evaluate("""
+    log("Inyectando token y disparando callback del widget…")
+    # Para reCAPTCHA INVISIBLE en Keycloak: además de inyectar el token,
+    # tenemos que disparar el callback del widget — sino el form no se
+    # somete. El callback está registrado en window.___grecaptcha_cfg.
+    result = page.evaluate("""
         (token) => {
+            // 1) Inyectar el token en todos los textareas posibles
             const tas = document.querySelectorAll('textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]');
             tas.forEach(ta => { ta.value = token; });
-            // Si el widget tiene callback registrado (Keycloak suele tenerlo)
+
+            // 2) Disparar el callback registrado del widget (si existe)
+            let callbackFired = false;
             try {
-                if (typeof grecaptcha !== 'undefined' && grecaptcha.getResponse) {
-                    // Forzamos a que reCAPTCHA reporte como resuelto
+                const cfg = window.___grecaptcha_cfg;
+                if (cfg && cfg.clients) {
+                    for (const k in cfg.clients) {
+                        const client = cfg.clients[k];
+                        // Recorremos recursivamente buscando "callback"
+                        const stack = [client];
+                        while (stack.length) {
+                            const cur = stack.pop();
+                            if (!cur || typeof cur !== 'object') continue;
+                            for (const prop in cur) {
+                                const v = cur[prop];
+                                if (typeof v === 'function' && prop === 'callback') {
+                                    try { v(token); callbackFired = true; } catch (e) {}
+                                } else if (typeof v === 'object' && v !== null) {
+                                    stack.push(v);
+                                }
+                            }
+                        }
+                    }
                 }
-            } catch(e) {}
+            } catch (e) { /* ignore */ }
+
+            // 3) Fallback: someter el form directo via JS (bypassea handlers)
+            if (!callbackFired) {
+                const form = document.querySelector('form#kc-form-login')
+                          || document.querySelector('form[action*="login"]')
+                          || document.querySelector('form');
+                if (form) HTMLFormElement.prototype.submit.call(form);
+                return 'form submitted directly';
+            }
+            return 'callback fired';
         }
     """, token)
-    log("✓ Token inyectado.")
+    log(f"✓ Token inyectado + acción: {result}")
 
 
 def _wait_for_manual_captcha_solve(page: Page) -> None:
