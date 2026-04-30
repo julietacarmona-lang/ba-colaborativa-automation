@@ -30,21 +30,26 @@ def solve_recaptcha_v2(
     site_key: str,
     timeout_s: int = 180,
     poll_interval_s: float = 5.0,
+    is_invisible: bool = True,
     log=print,
 ) -> str:
     """Manda un reCAPTCHA v2 a anti-captcha y devuelve el token de solución.
 
-    site_url   — URL de la página donde está el captcha
-    site_key   — el data-sitekey del widget reCAPTCHA
-    timeout_s  — máximo tiempo a esperar la solución
+    site_url       — URL de la página donde está el captcha
+    site_key       — el data-sitekey del widget reCAPTCHA
+    is_invisible   — True si es reCAPTCHA v2 invisible (Keycloak GCBA usa este)
+    timeout_s      — máximo tiempo a esperar la solución
     """
+    task = {
+        "type": "RecaptchaV2TaskProxyless",
+        "websiteURL": site_url,
+        "websiteKey": site_key,
+    }
+    if is_invisible:
+        task["isInvisible"] = True
     create_resp = _post("/createTask", {
         "clientKey": api_key,
-        "task": {
-            "type": "NoCaptchaTaskProxyless",
-            "websiteURL": site_url,
-            "websiteKey": site_key,
-        },
+        "task": task,
     })
     if create_resp.get("errorId", 0) != 0:
         raise RuntimeError(
