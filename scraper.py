@@ -309,6 +309,23 @@ def login(page: Page) -> None:
     except PlaywrightTimeoutError:
         if _captcha_present(page):
             _solve_captcha(page)
+            # Después de inyectar el token, hay que re-clickear Ingresar:
+            # el captcha aparece como interstitial DESPUÉS del primer submit,
+            # se resuelve, y el form necesita volver a someterse.
+            log("Re-clickeando 'Ingresar' después del captcha…")
+            try:
+                submit2 = _first_visible(
+                    page,
+                    [
+                        lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
+                        lambda: page.locator('input[type="submit"]'),
+                        lambda: page.locator('button[type="submit"]'),
+                    ],
+                    timeout_ms=5000,
+                )
+                submit2.click()
+            except Exception as e:
+                log(f"(no encontré submit post-captcha: {e})")
             page.wait_for_url(
                 re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                 timeout=120000,
