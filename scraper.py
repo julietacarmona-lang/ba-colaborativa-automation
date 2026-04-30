@@ -107,14 +107,16 @@ def is_logged_in(page: Page) -> bool:
 
 def _detect_auth_state(page: Page, timeout_s: float = 30.0) -> str:
     """Mira el DOM y devuelve uno de:
-       - 'login'       — hay un input type=password visible → hay que loguearse
-       - 'backoffice'  — estoy en el backoffice sin form de login → logueada
+       - 'login'       — hay un input type=password o textos de form de login
+       - 'backoffice'  — hay nav/header del backoffice visible (Contactos/Ciudadanos)
        - 'unknown'     — no detectó estado claro
 
-    Es distinto a 'estoy en la bandeja' — después de login, Keycloak suele
-    redirigir al home del backoffice, no directo a la bandeja.
+    Requiere evidencia POSITIVA del estado (no se basa solo en URL, que puede
+    ser engañosa durante redirects OIDC).
     """
     pw = page.locator('input[type="password"]')
+    login_text = page.get_by_text(re.compile(r"Iniciar sesi[oó]n|Usuario \(CUIL", re.I))
+    backoffice_nav = page.get_by_text(re.compile(r"^\s*(Contactos|Ciudadanos)\s*$", re.I))
     deadline = time.time() + timeout_s
     last_log = 0.0
     while time.time() < deadline:
@@ -125,15 +127,25 @@ def _detect_auth_state(page: Page, timeout_s: float = 30.0) -> str:
                 pass
             last_log = time.time()
 
-        url = page.url
+        # Login: hay password input o título "Iniciar sesión".
         try:
             if pw.first.is_visible(timeout=200):
                 return "login"
         except Exception:
             pass
-        if "bacolaborativa-backoffice" in url and "identidad-gcaba" not in url:
-            # En backoffice y sin password input visible → logueada.
-            return "backoffice"
+        try:
+            if login_text.first.is_visible(timeout=200):
+                return "login"
+        except Exception:
+            pass
+
+        # Backoffice: está renderizado el nav del backoffice.
+        try:
+            if backoffice_nav.first.is_visible(timeout=200):
+                return "backoffice"
+        except Exception:
+            pass
+
         page.wait_for_timeout(400)
 
     _dump_debug(page, "auth_unknown")
