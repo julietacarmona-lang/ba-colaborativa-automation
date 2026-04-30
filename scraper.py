@@ -308,24 +308,9 @@ def login(page: Page) -> None:
         )
     except PlaywrightTimeoutError:
         if _captcha_present(page):
+            # _solve_captcha ya somete el form via JS después de inyectar
+            # el token, así que no hace falta re-clickear "Ingresar".
             _solve_captcha(page)
-            # Después de inyectar el token, hay que re-clickear Ingresar:
-            # el captcha aparece como interstitial DESPUÉS del primer submit,
-            # se resuelve, y el form necesita volver a someterse.
-            log("Re-clickeando 'Ingresar' después del captcha…")
-            try:
-                submit2 = _first_visible(
-                    page,
-                    [
-                        lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
-                        lambda: page.locator('input[type="submit"]'),
-                        lambda: page.locator('button[type="submit"]'),
-                    ],
-                    timeout_ms=5000,
-                )
-                submit2.click()
-            except Exception as e:
-                log(f"(no encontré submit post-captcha: {e})")
             page.wait_for_url(
                 re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                 timeout=120000,
@@ -400,53 +385,27 @@ def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
     log(f"🤖 Anti-captcha: enviando reCAPTCHA (sitekey {site_key[:12]}…) desde {site_url[:60]}…")
     token = anti_captcha.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
 
-    log("Inyectando token y disparando callback del widget…")
-    # Para reCAPTCHA INVISIBLE en Keycloak: además de inyectar el token,
-    # tenemos que disparar el callback del widget — sino el form no se
-    # somete. El callback está registrado en window.___grecaptcha_cfg.
+    log("Inyectando token y sometiendo el form via JS…")
+    # Inyectar el token en el textarea hidden de g-recaptcha-response,
+    # después someter el form raw (bypasseando cualquier validación cliente
+    # que pueda rechazar el token).
     result = page.evaluate("""
         (token) => {
-            // 1) Inyectar el token en todos los textareas posibles
+            // 1) Inyectar token en textareas relevantes
             const tas = document.querySelectorAll('textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]');
             tas.forEach(ta => { ta.value = token; });
-
-            // 2) Disparar el callback registrado del widget (si existe)
-            let callbackFired = false;
-            try {
-                const cfg = window.___grecaptcha_cfg;
-                if (cfg && cfg.clients) {
-                    for (const k in cfg.clients) {
-                        const client = cfg.clients[k];
-                        // Recorremos recursivamente buscando "callback"
-                        const stack = [client];
-                        while (stack.length) {
-                            const cur = stack.pop();
-                            if (!cur || typeof cur !== 'object') continue;
-                            for (const prop in cur) {
-                                const v = cur[prop];
-                                if (typeof v === 'function' && prop === 'callback') {
-                                    try { v(token); callbackFired = true; } catch (e) {}
-                                } else if (typeof v === 'object' && v !== null) {
-                                    stack.push(v);
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e) { /* ignore */ }
-
-            // 3) Fallback: someter el form directo via JS (bypassea handlers)
-            if (!callbackFired) {
-                const form = document.querySelector('form#kc-form-login')
-                          || document.querySelector('form[action*="login"]')
-                          || document.querySelector('form');
-                if (form) HTMLFormElement.prototype.submit.call(form);
-                return 'form submitted directly';
+            // 2) Someter el form raw
+            const form = document.querySelector('form#kc-form-login')
+                      || document.querySelector('form[action*="login"]')
+                      || document.querySelector('form');
+            if (form) {
+                HTMLFormElement.prototype.submit.call(form);
+                return 'submitted (' + tas.length + ' textareas)';
             }
-            return 'callback fired';
+            return 'no form found';
         }
     """, token)
-    log(f"✓ Token inyectado + acción: {result}")
+    log(f"✓ {result}")
 
 
 def _wait_for_manual_captcha_solve(page: Page) -> None:
