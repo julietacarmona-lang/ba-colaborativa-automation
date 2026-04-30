@@ -55,6 +55,9 @@ jobs:
       SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
       # skip_slack=true silencia ambos webhooks (útil para pruebas manuales).
       SKIP_SLACK: ${{ inputs.skip_slack && '1' || '' }}
+      # API key de anti-captcha.com — si está, los captchas de Keycloak se
+      # resuelven automáticamente sin intervención humana.
+      ANTICAPTCHA_API_KEY: ${{ secrets.ANTICAPTCHA_API_KEY }}
       # Link al Sheets (se incluye al final de cada mensaje de Slack).
       SHEET_LINK: ${{ vars.SHEET_LINK }}
       # SMTP_HOST: ${{ secrets.SMTP_HOST }}

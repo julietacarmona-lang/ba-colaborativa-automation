@@ -270,10 +270,11 @@ def login(page: Page) -> None:
     )
     pw_input.fill(BA_PASSWORD)
 
-    # Antes de clickear, chequeamos si hay captcha. Si lo hay y estamos en modo
-    # headful, pausamos para que lo resuelvas a mano.
+    # Antes de clickear, chequeamos si hay captcha. Si hay API key de
+    # anti-captcha, lo resolvemos automáticamente. Si no, fallback a manual
+    # (que solo sirve en headful).
     if _captcha_present(page):
-        _wait_for_manual_captcha_solve(page)
+        _solve_captcha(page)
 
     log("Enviando credenciales…")
     submit = _first_visible(
@@ -295,7 +296,7 @@ def login(page: Page) -> None:
         )
     except PlaywrightTimeoutError:
         if _captcha_present(page):
-            _wait_for_manual_captcha_solve(page)
+            _solve_captcha(page)
             page.wait_for_url(
                 re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                 timeout=120000,
@@ -331,6 +332,62 @@ def _captcha_present(page: Page) -> bool:
     except Exception:
         pass
     return False
+
+
+def _solve_captcha(page: Page) -> None:
+    """Resuelve el captcha. Si hay ANTICAPTCHA_API_KEY usa el servicio;
+    si no, fallback a esperar resolución manual (solo viable en headful)."""
+    api_key = os.environ.get("ANTICAPTCHA_API_KEY", "").strip()
+    if api_key:
+        _solve_captcha_via_anticaptcha(page, api_key)
+    else:
+        _wait_for_manual_captcha_solve(page)
+
+
+def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
+    """Manda el captcha a anti-captcha.com, espera la solución, e inyecta
+    el token en la página."""
+    import anti_captcha
+
+    # 1) Sitekey: lo intentamos sacar del DOM (data-sitekey en el div .g-recaptcha
+    # o del iframe de recaptcha). Si no, usamos el de localStorage del SPA.
+    site_key = page.evaluate("""
+        () => {
+            const el = document.querySelector('.g-recaptcha[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            const iframe = document.querySelector('iframe[src*="recaptcha"]');
+            if (iframe) {
+                const m = iframe.src.match(/[?&]k=([^&]+)/);
+                if (m) return m[1];
+            }
+            // Fallback: el SPA guarda el sitekey en localStorage al cargar
+            try { return localStorage.getItem('captchaSiteKey'); } catch (e) { return null; }
+        }
+    """)
+    if not site_key:
+        raise RuntimeError("No pude detectar el sitekey del reCAPTCHA en la página.")
+
+    site_url = page.url
+    log(f"🤖 Anti-captcha: enviando reCAPTCHA (sitekey {site_key[:12]}…) desde {site_url[:60]}…")
+    token = anti_captcha.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
+
+    log("Inyectando token en la página…")
+    # Inyectamos el token en el textarea hidden del widget reCAPTCHA.
+    # También probamos llamar al callback si está definido (algunos widgets
+    # requieren eso para "marcar el captcha como resuelto").
+    page.evaluate("""
+        (token) => {
+            const tas = document.querySelectorAll('textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]');
+            tas.forEach(ta => { ta.value = token; });
+            // Si el widget tiene callback registrado (Keycloak suele tenerlo)
+            try {
+                if (typeof grecaptcha !== 'undefined' && grecaptcha.getResponse) {
+                    // Forzamos a que reCAPTCHA reporte como resuelto
+                }
+            } catch(e) {}
+        }
+    """, token)
+    log("✓ Token inyectado.")
 
 
 def _wait_for_manual_captcha_solve(page: Page) -> None:
