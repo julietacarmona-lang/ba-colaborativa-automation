@@ -47,7 +47,11 @@ def solve_recaptcha_v2(
         "type": "RecaptchaV3TaskProxyless",
         "websiteURL": site_url,
         "websiteKey": site_key,
-        "minScore": 0.3,
+        # minScore=0.9 fuerza al solver a darnos tokens con score alto.
+        # El GCBA tiene threshold estricto y rechaza scores bajos con
+        # "Error en el reCAPTCHA". Con 0.3 era inconsistente (a veces pasa,
+        # a veces no). Cuesta un poco más por captcha pero es confiable.
+        "minScore": 0.9,
         "pageAction": "login",
         "isEnterprise": True,
     }
