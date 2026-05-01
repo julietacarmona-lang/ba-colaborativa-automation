@@ -41,7 +41,7 @@ def solve_recaptcha_v2(
     timeout_s      — máximo tiempo a esperar la solución
     """
     task = {
-        "type": "RecaptchaV2TaskProxyless",
+        "type": "RecaptchaV2EnterpriseTaskProxyless",
         "websiteURL": site_url,
         "websiteKey": site_key,
     }
