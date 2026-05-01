@@ -41,12 +41,13 @@ def solve_recaptcha_v2(
     timeout_s      — máximo tiempo a esperar la solución
     """
     task = {
-        "type": "RecaptchaV2EnterpriseTaskProxyless",
+        "type": "RecaptchaV3TaskProxyless",
         "websiteURL": site_url,
         "websiteKey": site_key,
+        "minScore": 0.3,
+        "pageAction": "login",
     }
-    if is_invisible:
-        task["isInvisible"] = True
+    # is_invisible no aplica a V3
     create_resp = _post("/createTask", {
         "clientKey": api_key,
         "task": task,

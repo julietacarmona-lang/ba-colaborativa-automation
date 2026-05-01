@@ -311,6 +311,22 @@ def login(page: Page) -> None:
             # _solve_captcha ya somete el form via JS después de inyectar
             # el token, así que no hace falta re-clickear "Ingresar".
             _solve_captcha(page)
+            # Diagnóstico: capturamos qué responde Keycloak después del submit
+            # para entender por qué falla (mensaje de error visible).
+            page.wait_for_timeout(5000)
+            try:
+                error_text = page.evaluate("""
+                    () => {
+                        const errs = document.querySelectorAll('.kc-feedback-text, .alert, .error, [class*="error"], [class*="Error"]');
+                        return Array.from(errs).map(e => e.textContent.trim()).filter(Boolean).join(' | ').substring(0, 500);
+                    }
+                """)
+                if error_text:
+                    log(f"📋 Mensaje de Keycloak post-submit: {error_text}")
+                log(f"📋 URL post-submit: {page.url[:120]}")
+            except Exception:
+                pass
+            _dump_debug(page, "after_captcha_submit")
             page.wait_for_url(
                 re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                 timeout=120000,
