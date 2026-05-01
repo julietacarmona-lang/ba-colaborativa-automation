@@ -402,21 +402,27 @@ def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
     token = anti_captcha.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
 
     log("Inyectando token y sometiendo el form via JS…")
-    # Inyectar el token en el textarea hidden de g-recaptcha-response,
-    # después someter el form raw (bypasseando cualquier validación cliente
-    # que pueda rechazar el token).
+    # IMPORTANTE: Keycloak GCBA usa Enterprise V3 con un campo llamado
+    # "g-recaptcha-token" (NO el "g-recaptcha-response" estándar de v2).
+    # Inyectamos en ambos por las dudas + sometemos el form raw.
     result = page.evaluate("""
         (token) => {
-            // 1) Inyectar token en textareas relevantes
-            const tas = document.querySelectorAll('textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]');
-            tas.forEach(ta => { ta.value = token; });
-            // 2) Someter el form raw
+            // Buscamos todos los campos posibles donde el token podría ir
+            const fields = [
+                ...document.querySelectorAll('input[name="g-recaptcha-token"]'),
+                ...document.querySelectorAll('input[id="g-recaptcha-token"]'),
+                ...document.querySelectorAll('textarea[name="g-recaptcha-response"]'),
+                ...document.querySelectorAll('textarea[id^="g-recaptcha-response"]'),
+            ];
+            fields.forEach(f => { f.value = token; });
+
+            // Someter el form
             const form = document.querySelector('form#kc-form-login')
                       || document.querySelector('form[action*="login"]')
                       || document.querySelector('form');
             if (form) {
                 HTMLFormElement.prototype.submit.call(form);
-                return 'submitted (' + tas.length + ' textareas)';
+                return 'submitted (' + fields.length + ' fields injected)';
             }
             return 'no form found';
         }

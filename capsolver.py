@@ -1,6 +1,11 @@
-"""Cliente HTTP de Anti-Captcha (anti-captcha.com) para resolver reCAPTCHA v2.
+"""Cliente HTTP de CapSolver (capsolver.com) para resolver reCAPTCHA.
 
-API ref: https://anti-captcha.com/apidoc/task-types/NoCaptchaTaskProxyless
+Soporta v2, v2-invisible y v2-Enterprise. Usamos Enterprise porque es
+lo que mostró ser el caso para el Keycloak del GCBA (anti-captcha rechaza
+el sitekey con 'is from another Recaptcha type', mientras que CapSolver
+acepta y resuelve como Enterprise).
+
+API ref: https://docs.capsolver.com/guide/captcha/ReCaptchaV2.html
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
-API_BASE = "https://api.anti-captcha.com"
+API_BASE = "https://api.capsolver.com"
 
 
 def _post(path: str, payload: dict, timeout: int = 30) -> dict:
@@ -24,46 +29,49 @@ def _post(path: str, payload: dict, timeout: int = 30) -> dict:
         return json.loads(resp.read())
 
 
-def solve_recaptcha_v2(
+def solve_recaptcha(
     api_key: str,
     site_url: str,
     site_key: str,
-    timeout_s: int = 180,
-    poll_interval_s: float = 5.0,
+    *,
+    enterprise: bool = True,
     is_invisible: bool = True,
+    timeout_s: int = 180,
+    poll_interval_s: float = 3.0,
     log=print,
 ) -> str:
-    """Manda un reCAPTCHA v2 a anti-captcha y devuelve el token de solución.
+    """Manda un reCAPTCHA a CapSolver y devuelve el token gRecaptchaResponse.
 
-    site_url       — URL de la página donde está el captcha
-    site_key       — el data-sitekey del widget reCAPTCHA
-    is_invisible   — True si es reCAPTCHA v2 invisible (Keycloak GCBA usa este)
-    timeout_s      — máximo tiempo a esperar la solución
+    enterprise    — usar el endpoint de Enterprise (lo que necesita el GCBA)
+    is_invisible  — si el widget es invisible (típico en Enterprise / login forms)
     """
-    # Keycloak GCBA usa reCAPTCHA Enterprise V3 con action="login"
-    # (descubierto inspeccionando el script grecaptcha.enterprise.execute en
-    # el form de Keycloak).
+    if enterprise:
+        task_type = "ReCaptchaV2EnterpriseTaskProxyLess"
+    else:
+        task_type = "ReCaptchaV2TaskProxyLess"
+
     task = {
-        "type": "RecaptchaV3TaskProxyless",
+        "type": task_type,
         "websiteURL": site_url,
         "websiteKey": site_key,
-        "minScore": 0.3,
-        "pageAction": "login",
-        "isEnterprise": True,
     }
+    if is_invisible:
+        task["isInvisible"] = True
+
     create_resp = _post("/createTask", {
         "clientKey": api_key,
         "task": task,
     })
     if create_resp.get("errorId", 0) != 0:
         raise RuntimeError(
-            f"Anti-captcha createTask falló: "
+            f"CapSolver createTask falló: "
             f"{create_resp.get('errorCode')} — {create_resp.get('errorDescription')}"
         )
     task_id = create_resp["taskId"]
-    log(f"[anticaptcha] tarea creada (id={task_id}), esperando solución…")
+    log(f"[capsolver] tarea creada (id={task_id}, type={task_type}), esperando…")
 
     deadline = time.time() + timeout_s
+    started = time.time()
     while time.time() < deadline:
         time.sleep(poll_interval_s)
         result = _post("/getTaskResult", {
@@ -72,22 +80,23 @@ def solve_recaptcha_v2(
         })
         if result.get("errorId", 0) != 0:
             raise RuntimeError(
-                f"Anti-captcha getTaskResult falló: "
+                f"CapSolver getTaskResult falló: "
                 f"{result.get('errorCode')} — {result.get('errorDescription')}"
             )
-        if result.get("status") == "ready":
-            elapsed = int(time.time() - (deadline - timeout_s))
-            log(f"[anticaptcha] ✓ resuelto en {elapsed}s")
+        status = result.get("status")
+        if status == "ready":
+            elapsed = int(time.time() - started)
+            log(f"[capsolver] ✓ resuelto en {elapsed}s")
             return result["solution"]["gRecaptchaResponse"]
 
-    raise TimeoutError(f"Anti-captcha no resolvió en {timeout_s}s.")
+    raise TimeoutError(f"CapSolver no resolvió en {timeout_s}s.")
 
 
 def get_balance(api_key: str) -> float:
-    """Devuelve el saldo en USD de la cuenta."""
+    """Devuelve el saldo en USD de la cuenta CapSolver."""
     resp = _post("/getBalance", {"clientKey": api_key})
     if resp.get("errorId", 0) != 0:
         raise RuntimeError(
-            f"Anti-captcha getBalance falló: {resp.get('errorDescription')}"
+            f"CapSolver getBalance falló: {resp.get('errorDescription')}"
         )
     return float(resp["balance"])
