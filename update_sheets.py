@@ -100,9 +100,11 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> dict:
     range_str = f"A{next_row}:{last_col_letter}{end_row}"
 
     log(f"Insertando {len(rows_to_append)} filas en {range_str}…")
+    # Usamos argumentos nombrados (no posicionales) — gspread cambió el orden
+    # entre versiones y los nombrados son robustos a esos cambios.
     ws.update(
-        range_str,
-        rows_to_append,
+        range_name=range_str,
+        values=rows_to_append,
         value_input_option="USER_ENTERED",
     )
     log("✓ Listo.")
