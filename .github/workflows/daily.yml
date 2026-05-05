@@ -33,12 +33,12 @@ jobs:
       SHEET_TAB: ${{ vars.SHEET_TAB || 'Tickets - General' }}
       GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
-      # En CI corremos con Chrome real (channel=chrome), modo persistente,
-      # cookies inyectadas y display virtual (xvfb). HEADLESS=false porque
-      # muchas apps detectan headless explícitamente.
+      # En CI lanzamos Chrome NOSOTROS (no Playwright) y nos conectamos por
+      # CDP — así Chrome arranca SIN flags de automation y reCAPTCHA no nos
+      # detecta como bot. Replicamos lo que hace ./scripts/chrome-cdp.sh local.
       HEADLESS: "false"
-      BROWSER_MODE: persistent
-      BROWSER_CHANNEL: chrome
+      BROWSER_MODE: cdp
+      CDP_URL: http://localhost:9222
       LOGIN_MODE: auto
       MAX_ATTEMPTS: "2"
       SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
@@ -91,8 +91,39 @@ jobs:
       - name: Install Xvfb (display virtual para correr headed)
         run: sudo apt-get install -y xvfb
 
-      - name: Run pipeline (headed bajo Xvfb)
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" python main.py
+      - name: Lanzar Chrome con remote debugging (NO con Playwright)
+        # Lanzamos Chrome NOSOTROS via shell, sin flags de automation, así
+        # reCAPTCHA no lo detecta como bot. Después el scraper se conecta por
+        # CDP. Replica exactamente lo que hace ./scripts/chrome-cdp.sh local.
+        run: |
+          # Display virtual
+          Xvfb :99 -screen 0 1280x900x24 &
+          sleep 1
+          export DISPLAY=:99
+          # Chrome con remote debugging, perfil dedicado
+          mkdir -p /tmp/chrome-cdp-profile
+          google-chrome \
+            --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/chrome-cdp-profile \
+            --no-default-browser-check \
+            --no-first-run \
+            --disable-dev-shm-usage \
+            --no-sandbox \
+            'about:blank' &
+          # Esperar a que el puerto CDP esté listo (max 30s)
+          for i in {1..30}; do
+            if curl -sf http://localhost:9222/json/version > /dev/null; then
+              echo "✓ Chrome CDP listo (intento $i)"
+              break
+            fi
+            sleep 1
+          done
+          curl -s http://localhost:9222/json/version
+
+      - name: Run pipeline (CDP a Chrome lanzado externamente)
+        run: |
+          export DISPLAY=:99
+          python main.py
 
       - name: Refrescar BA_SESSION_JSON con cookies renovadas
         # Solo si la corrida fue OK y el scraper dejó session_refreshed.json.
