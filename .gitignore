@@ -11,3 +11,4 @@ downloads/
 .playwright-user-data/
 session.json
 .claude/
+.playwright-debug-chrome/
