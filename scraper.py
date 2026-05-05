@@ -297,7 +297,9 @@ def login(page: Page) -> None:
             lambda: page.locator('button[type="submit"]'),
         ],
     )
-    submit.click()
+    # force=True ignora el badge invisible del reCAPTCHA que puede intercept
+    # los pointer events sobre el botón "Ingresar".
+    submit.click(force=True)
 
     # Después de clickear Ingresar puede saltar un captcha interstitial.
     # Si vemos uno y estamos headful, esperamos a que lo resuelvas.
