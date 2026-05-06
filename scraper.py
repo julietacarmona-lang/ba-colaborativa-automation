@@ -270,7 +270,18 @@ def login(page: Page) -> None:
         ],
         timeout_ms=30000,
     )
-    user_input.fill(BA_USER)
+
+    # Esperamos un poco para que el JS de reCAPTCHA Enterprise tenga tiempo
+    # de generar su token natural. Sin esta pausa el score baja porque
+    # llenamos todo en milisegundos.
+    page.wait_for_timeout(2500)
+
+    # Tipeo "humano" con delay entre teclas — fill() instantáneo da score bajo.
+    log("Tipeando CUIL…")
+    user_input.click()
+    user_input.type(BA_USER, delay=80)
+
+    page.wait_for_timeout(800)
 
     pw_input = _first_visible(
         page,
@@ -280,13 +291,16 @@ def login(page: Page) -> None:
             lambda: page.locator('input[name="password"]'),
         ],
     )
-    pw_input.fill(BA_PASSWORD)
+    log("Tipeando contraseña…")
+    pw_input.click()
+    pw_input.type(BA_PASSWORD, delay=80)
 
-    # Antes de clickear, chequeamos si hay captcha. Si hay API key de
-    # anti-captcha, lo resolvemos automáticamente. Si no, fallback a manual
-    # (que solo sirve en headful).
-    if _captcha_present(page):
-        _solve_captcha(page)
+    # Pausa antes de clickear — humano lee/duda antes de submit.
+    page.wait_for_timeout(1500)
+
+    # NO llamamos a anti-captcha antes del primer submit: la página ya tiene
+    # un token generado por el JS de Google al cargar. Submitamos con ese
+    # primero. Si Keycloak lo rechaza, el bloque de retry abajo usa anti-captcha.
 
     log("Enviando credenciales…")
     submit = _first_visible(
