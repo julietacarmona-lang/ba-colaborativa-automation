@@ -99,6 +99,14 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> dict:
     last_col_letter = gspread.utils.rowcol_to_a1(1, len(headers)).rstrip("1")
     range_str = f"A{next_row}:{last_col_letter}{end_row}"
 
+    # El grid del worksheet tiene un row_count fijo. Si vamos a escribir más
+    # allá del límite, gspread devuelve 400 "exceeds grid limits". Extender
+    # con un buffer extra para no extender en cada corrida.
+    if end_row > ws.row_count:
+        needed = end_row - ws.row_count + 100
+        log(f"Extendiendo grid: +{needed} filas (actual={ws.row_count}).")
+        ws.add_rows(needed)
+
     log(f"Insertando {len(rows_to_append)} filas en {range_str}…")
     # Usamos argumentos nombrados (no posicionales) — gspread cambió el orden
     # entre versiones y los nombrados son robustos a esos cambios.

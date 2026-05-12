@@ -1041,8 +1041,11 @@ def download_tickets() -> Path:
             last_exc = e
             log(f"Intento {attempt} falló: {e!r}")
             if attempt < MAX_ATTEMPTS:
-                # Pausa progresiva entre reintentos.
-                pause = 5 * attempt
+                # Los 2 primeros fallos suelen ser captcha/timing — reintento
+                # rápido. Si seguimos fallando, la plataforma está caída
+                # (pasa: ver incidente 09-11/05) y conviene darle aire.
+                pauses = [1, 1, 60, 90]
+                pause = pauses[attempt - 1] if attempt - 1 < len(pauses) else 90
                 log(f"Esperando {pause}s antes de reintentar…")
                 time.sleep(pause)
 

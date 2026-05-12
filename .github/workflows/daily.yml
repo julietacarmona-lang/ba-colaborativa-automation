@@ -40,7 +40,7 @@ jobs:
       BROWSER_MODE: cdp
       CDP_URL: http://localhost:9222
       LOGIN_MODE: auto
-      MAX_ATTEMPTS: "2"
+      MAX_ATTEMPTS: "5"
       SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
 
       # Notificación por mail en caso de fallo
