@@ -55,8 +55,9 @@ jobs:
       SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
       # skip_slack=true silencia ambos webhooks (útil para pruebas manuales).
       SKIP_SLACK: ${{ inputs.skip_slack && '1' || '' }}
-      # API key de anti-captcha.com — si está, los captchas de Keycloak se
-      # resuelven automáticamente sin intervención humana.
+      # Solvers de captcha. Si ambos están, scraper.py prueba CapSolver primero
+      # (mejor con reCAPTCHA Enterprise V3 del GCBA) y cae a anti-captcha si falla.
+      CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
       ANTICAPTCHA_API_KEY: ${{ secrets.ANTICAPTCHA_API_KEY }}
       # Link al Sheets (se incluye al final de cada mensaje de Slack).
       SHEET_LINK: ${{ vars.SHEET_LINK }}

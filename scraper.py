@@ -381,22 +381,23 @@ def _captcha_present(page: Page) -> bool:
 
 
 def _solve_captcha(page: Page) -> None:
-    """Resuelve el captcha. Si hay ANTICAPTCHA_API_KEY usa el servicio;
-    si no, fallback a esperar resolución manual (solo viable en headful)."""
-    api_key = os.environ.get("ANTICAPTCHA_API_KEY", "").strip()
-    if api_key:
-        _solve_captcha_via_anticaptcha(page, api_key)
-    else:
+    """Resuelve el captcha. Prueba CapSolver primero (mejor con Enterprise V3),
+    cae a anti-captcha si CapSolver falla o no está configurado, y al modo
+    manual si no hay ninguna API key."""
+    import importlib
+
+    # Orden importa: CapSolver primero porque sus tokens pasan el threshold
+    # del GCBA y los de anti-captcha vienen siendo rechazados.
+    providers = []
+    if os.environ.get("CAPSOLVER_API_KEY", "").strip():
+        providers.append(("CapSolver", "CAPSOLVER_API_KEY", "capsolver"))
+    if os.environ.get("ANTICAPTCHA_API_KEY", "").strip():
+        providers.append(("Anti-captcha", "ANTICAPTCHA_API_KEY", "anti_captcha"))
+
+    if not providers:
         _wait_for_manual_captcha_solve(page)
+        return
 
-
-def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
-    """Manda el captcha a anti-captcha.com, espera la solución, e inyecta
-    el token en la página."""
-    import anti_captcha
-
-    # 1) Sitekey: lo intentamos sacar del DOM (data-sitekey en el div .g-recaptcha
-    # o del iframe de recaptcha). Si no, usamos el de localStorage del SPA.
     site_key = page.evaluate("""
         () => {
             const el = document.querySelector('.g-recaptcha[data-sitekey]');
@@ -406,24 +407,38 @@ def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
                 const m = iframe.src.match(/[?&]k=([^&]+)/);
                 if (m) return m[1];
             }
-            // Fallback: el SPA guarda el sitekey en localStorage al cargar
             try { return localStorage.getItem('captchaSiteKey'); } catch (e) { return null; }
         }
     """)
     if not site_key:
         raise RuntimeError("No pude detectar el sitekey del reCAPTCHA en la página.")
-
     site_url = page.url
-    log(f"🤖 Anti-captcha: enviando reCAPTCHA (sitekey {site_key[:12]}…) desde {site_url[:60]}…")
-    token = anti_captcha.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
 
+    last_err: Optional[BaseException] = None
+    for label, env_var, module_name in providers:
+        try:
+            api_key = os.environ[env_var].strip()
+            module = importlib.import_module(module_name)
+            log(f"🤖 {label}: enviando reCAPTCHA (sitekey {site_key[:12]}…) desde {site_url[:60]}…")
+            token = module.solve_recaptcha_v2(api_key, site_url, site_key, log=log)
+            _inject_token_and_submit(page, token)
+            return
+        except Exception as e:
+            log(f"⚠️  {label} falló: {e!r}. Probando siguiente proveedor…")
+            last_err = e
+            continue
+
+    assert last_err is not None
+    raise last_err
+
+
+def _inject_token_and_submit(page: Page, token: str) -> None:
+    """Inyecta el token reCAPTCHA en todos los campos posibles y somete el
+    form via JS. Keycloak GCBA usa Enterprise V3 con campo 'g-recaptcha-token'
+    (no el 'g-recaptcha-response' estándar de v2), así que inyectamos en ambos."""
     log("Inyectando token y sometiendo el form via JS…")
-    # IMPORTANTE: Keycloak GCBA usa Enterprise V3 con un campo llamado
-    # "g-recaptcha-token" (NO el "g-recaptcha-response" estándar de v2).
-    # Inyectamos en ambos por las dudas + sometemos el form raw.
     result = page.evaluate("""
         (token) => {
-            // Buscamos todos los campos posibles donde el token podría ir
             const fields = [
                 ...document.querySelectorAll('input[name="g-recaptcha-token"]'),
                 ...document.querySelectorAll('input[id="g-recaptcha-token"]'),
@@ -432,7 +447,6 @@ def _solve_captcha_via_anticaptcha(page: Page, api_key: str) -> None:
             ];
             fields.forEach(f => { f.value = token; });
 
-            // Someter el form
             const form = document.querySelector('form#kc-form-login')
                       || document.querySelector('form[action*="login"]')
                       || document.querySelector('form');
