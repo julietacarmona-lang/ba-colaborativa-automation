@@ -1,11 +1,18 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # Todos los días a las 11:00 UTC (8:00 Argentina). Incluye sábado y domingo
-  # — corre igual aunque no haya tickets nuevos, así la sesión de Keycloak
-  # no expira por inactividad durante el fin de semana.
+  # Corre 4 veces al día (cada 6h) para mantener las cookies de Keycloak vivas
+  # y evitar el captcha (que falla desde IPs de GH Actions). El SPA hace silent
+  # SSO mientras las cookies estén vigentes; si caducan, vuelve al login form
+  # → captcha → fail. Por eso refrescamos seguido.
+  #
+  # Solo la corrida de las 11:00 UTC (8:00 Argentina) manda mensaje a Slack al
+  # equipo. Las otras 3 son keep-alives silenciosas — refrescan cookies y se van.
   schedule:
-    - cron: "0 11 * * *"
+    - cron: "0 11 * * *"  # 8am ARG — corrida "oficial" con Slack
+    - cron: "0 5 * * *"   # 2am ARG — keep-alive silencioso
+    - cron: "0 17 * * *"  # 14h ARG — keep-alive silencioso
+    - cron: "0 23 * * *"  # 20h ARG — keep-alive silencioso
   workflow_dispatch:
     inputs:
       skip_slack:
@@ -53,8 +60,14 @@ jobs:
       # - SLACK_WEBHOOK_URL_ERROR: errores (canal privado del owner).
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
-      # skip_slack=true silencia ambos webhooks (útil para pruebas manuales).
-      SKIP_SLACK: ${{ inputs.skip_slack && '1' || '' }}
+      # SKIP_SLACK=1 silencia ambos webhooks. Lo activamos en:
+      #  - workflow_dispatch con skip_slack=true (pruebas manuales)
+      #  - cron que NO sea "0 11 * * *" (los 3 keep-alives silenciosos cada 6h)
+      # Así el canal del equipo solo ve la corrida oficial de las 11 UTC,
+      # no las 3 corridas extra que solo refrescan cookies.
+      SKIP_SLACK: >-
+        ${{ ((inputs.skip_slack == true) || (github.event_name == 'schedule' && github.event.schedule != '0 11 * * *'))
+            && '1' || '' }}
       # Solvers de captcha. Si ambos están, scraper.py prueba CapSolver primero
       # (mejor con reCAPTCHA Enterprise V3 del GCBA) y cae a anti-captcha si falla.
       CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
