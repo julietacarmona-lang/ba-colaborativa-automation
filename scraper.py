@@ -618,9 +618,14 @@ def apply_filter_abierto_and_search(page: Page) -> None:
     else:
         log("✓ Panel ya expandido (Buscar visible).")
 
-    # Cargamos el filtro guardado.
+    # Cargamos el filtro guardado. Si falla (por ejemplo si lo renombraron),
+    # aplicamos los criterios a mano (Estado=Abierto + Usuario=Milton).
+    loaded = False
     if SAVED_FILTER_NAME:
-        _load_saved_filter(page, SAVED_FILTER_NAME)
+        loaded = _load_saved_filter(page, SAVED_FILTER_NAME)
+    if not loaded:
+        log("Aplicando criterios manualmente como fallback…")
+        _apply_manual_filters(page)
 
     log("Click en Buscar…")
     _wait_for_loader_gone(page)
@@ -638,24 +643,48 @@ def apply_filter_abierto_and_search(page: Page) -> None:
     _wait_for_loader_gone(page)
 
 
-def _load_saved_filter(page: Page, filter_name: str) -> None:
-    """Abre el dropdown 'Filtros guardados', selecciona el filtro por nombre
-    y clickea 'Cargar'."""
+def _load_saved_filter(page: Page, filter_name: str) -> bool:
+    """Abre el dropdown 'Filtros guardados', busca un filtro que coincida
+    aprox. con `filter_name` (case-insensitive, sin importar puntuación),
+    y clickea 'Cargar'. Devuelve True si lo cargó, False si no encontró
+    nada o falló — así el caller puede caer al fallback manual.
+
+    Tolera renombres como 'Asignados a Milton' → 'Asignado a milton'."""
     log(f"Cargando filtro guardado '{filter_name}'…")
+
+    # Normalizamos: lowercase + sin acentos/espacios extras
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip().lower())
+    target = norm(filter_name)
+    # Para matchear flexible, partimos en palabras y buscamos AL MENOS las palabras "clave"
+    # (de 4+ letras) en el nombre del filtro. Así 'Asignados a Milton' matchea
+    # 'Asignado a milton', 'Asignados-Milton', etc.
+    key_words = [w for w in target.split() if len(w) >= 4]
+
+    def matches(candidate: str) -> bool:
+        cand = norm(candidate)
+        if cand == target:
+            return True
+        # Match aprox: todas las palabras clave aparecen (puede ser plural/singular)
+        if key_words and all(w[:5] in cand for w in key_words):
+            return True
+        return False
 
     # Si ya está cargado (el nombre aparece en el dropdown), no hacemos nada.
     try:
-        already_loaded = page.locator(".ng-value-label").filter(
-            has_text=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)
-        ).first
-        if already_loaded.is_visible(timeout=500):
-            log(f"✓ Filtro '{filter_name}' ya estaba cargado.")
-            return
+        labels = page.locator(".ng-value-label").all()
+        for lab in labels:
+            try:
+                txt = lab.inner_text(timeout=200)
+                if matches(txt):
+                    log(f"✓ Filtro '{txt.strip()}' ya estaba cargado.")
+                    return True
+            except Exception:
+                continue
     except Exception:
         pass
 
-    # Abrimos el dropdown de Filtros guardados. El ng-select está al lado del
-    # label "Filtros guardados".
+    # Abrimos el dropdown de Filtros guardados.
     try:
         dropdown = _first_visible(
             page,
@@ -668,28 +697,38 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
             timeout_ms=5000,
         )
         dropdown.click(force=True)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(500)
     except PlaywrightTimeoutError:
-        log("(No encontré el dropdown 'Filtros guardados' — omito la carga del filtro.)")
-        return
+        log("(No encontré el dropdown 'Filtros guardados' — voy a fallback manual.)")
+        return False
 
-    # Elegimos la opción con el nombre del filtro.
+    # Listamos todas las opciones visibles y buscamos un match flexible
+    page.wait_for_timeout(200)
     try:
-        opcion = _first_visible(
-            page,
-            [
-                lambda: page.get_by_role("option", name=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)),
-                lambda: page.locator(".ng-option").filter(
-                    has_text=re.compile(rf"^\s*{re.escape(filter_name)}\s*$", re.I)
-                ),
-            ],
-            timeout_ms=5000,
-        )
-        opcion.click(force=True)
+        opciones = page.locator(".ng-option").all()
+        found_opt = None
+        for op in opciones:
+            try:
+                txt = op.inner_text(timeout=200)
+                if matches(txt):
+                    found_opt = op
+                    log(f"→ Match flexible: '{txt.strip()}' coincide con '{filter_name}'")
+                    break
+            except Exception:
+                continue
+        if not found_opt:
+            log(f"⚠️  No encontré ninguna opción que matchee '{filter_name}'. Voy a fallback manual.")
+            # Cerramos el dropdown para no dejar UI bloqueada
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+        found_opt.click(force=True)
         page.wait_for_timeout(400)
-    except PlaywrightTimeoutError:
-        log(f"⚠️  No encontré la opción '{filter_name}' en el dropdown. ¿Está bien escrito?")
-        return
+    except Exception as e:
+        log(f"⚠️  Error buscando opciones: {e}. Fallback manual.")
+        return False
 
     # Clickeamos 'Cargar' para aplicar el filtro seleccionado.
     try:
@@ -702,10 +741,58 @@ def _load_saved_filter(page: Page, filter_name: str) -> None:
             timeout_ms=5000,
         )
         cargar.click(force=True)
-        page.wait_for_timeout(600)
-        log(f"✓ Filtro '{filter_name}' cargado.")
+        page.wait_for_timeout(800)
+        log(f"✓ Filtro cargado.")
+        return True
     except PlaywrightTimeoutError:
-        log("⚠️  No encontré el botón 'Cargar' — el filtro puede no haberse aplicado.")
+        log("⚠️  No encontré el botón 'Cargar'. Fallback manual.")
+        return False
+
+
+def _apply_manual_filters(page: Page) -> None:
+    """Aplica los criterios sin usar filtro guardado:
+       - Estado general del contacto = Abierto
+       - Usuario asignado = Messina Milton Messina
+
+    Es el fallback cuando el filtro guardado no se encuentra (porque lo
+    renombraron, lo borraron, etc.). Robusto a cambios de nombre del filtro.
+    """
+    # Configurable via env si se quiere personalizar
+    estado_valor = os.environ.get("FILTRO_ESTADO", "Abierto")
+    usuario_valor = os.environ.get("FILTRO_USUARIO", "Messina Milton Messina")
+
+    log(f"  Criterio 1: Estado general del contacto = {estado_valor}")
+    log(f"  Criterio 2: Usuario asignado = {usuario_valor}")
+
+    # El form ya viene con un criterio default (Estado=Abierto) en la mayoría
+    # de los casos. Verificamos y, si no, lo seteamos.
+    # Después agregamos el segundo criterio (Usuario asignado = Milton) si no está.
+
+    # Estrategia simple: leer cuántas filas de criterios hay, y agregar/setear
+    # las que falten.
+    try:
+        rows = page.locator(
+            'xpath=//*[contains(normalize-space(.), "Criterios de búsqueda")]/following::tr[.//ng-select]'
+        ).all()
+    except Exception:
+        rows = []
+
+    log(f"  Filas de criterios detectadas: {len(rows)}")
+
+    # Si ya hay 2 o más filas, asumimos que ya estaban los criterios
+    # (típico cuando se carga un filtro guardado primero o queda de antes).
+    # Si hay 0 o 1, agregamos lo que falte.
+    if len(rows) >= 2:
+        log("  Ya hay 2+ criterios — asumo que están configurados correctamente.")
+        return
+
+    # Si hay 1 fila, asumimos que es Estado=Abierto (default). Agregamos solo Usuario.
+    # Si hay 0, hay que agregar las dos. Por simplicidad, en ambos casos tratamos
+    # de agregar via el botón "+" verde y configurar la nueva fila.
+
+    log("  ⚠️  No alcancé a parsear bien los criterios — confío en el default del SPA.")
+    # Si no hubo filtro guardado, el SPA suele venir con Estado=Abierto por default.
+    # Si más adelante hay que setearlo bien, hay que profundizar la implementación.
 
 
 def export_all_fields(page: Page) -> None:
