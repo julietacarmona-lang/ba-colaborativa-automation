@@ -154,7 +154,9 @@ def _detect_auth_state(page: Page, timeout_s: float = 30.0) -> str:
 
 def _detect_bandeja(page: Page, timeout_s: float = 30.0) -> bool:
     """Una vez logueada, espera a que aparezcan controles típicos de la bandeja
-    (botón Exportar o Buscar)."""
+    (botón Exportar o Buscar). Solo considera 'bandeja' si la URL es del
+    backoffice — evita falsos positivos en chrome://new-tab-page (que tiene
+    'Buscar en Google') u otras pantallas."""
     bandeja_btn = page.get_by_role(
         "button", name=re.compile(r"exportar|buscar", re.I)
     )
@@ -168,8 +170,10 @@ def _detect_bandeja(page: Page, timeout_s: float = 30.0) -> bool:
                 pass
             last_log = time.time()
         try:
-            if bandeja_btn.first.is_visible(timeout=300):
-                return True
+            url = page.url
+            if "bacolaborativa-backoffice" in url and "identidad-gcaba" not in url:
+                if bandeja_btn.first.is_visible(timeout=300):
+                    return True
         except Exception:
             pass
         page.wait_for_timeout(400)
@@ -311,21 +315,31 @@ def login(page: Page) -> None:
             lambda: page.locator('button[type="submit"]'),
         ],
     )
-    # force=True ignora el badge invisible del reCAPTCHA que puede intercept
-    # los pointer events sobre el botón "Ingresar".
-    submit.click(force=True)
+    # Click normal (NO force) — un click sintético con force gatilla
+    # detección de automation en Google reCAPTCHA y baja el score.
+    # Si falla por el badge invisible del reCAPTCHA, ahí caemos al fallback.
+    try:
+        submit.click()
+    except Exception as e:
+        log(f"⚠️  click normal falló ({e}), reintento con force=True")
+        submit.click(force=True)
 
-    # Después de clickear Ingresar puede saltar un captcha interstitial.
-    # Si vemos uno y estamos headful, esperamos a que lo resuelvas.
+    # Esperamos largo para que el captcha INVISIBLE termine naturalmente.
+    # Desde IP residencial, Google suele dar score alto → redirige sin pedir
+    # nada. Pero la cadena Angular → grecaptcha.enterprise.execute() →
+    # validación server-side puede tardar 20-40s. Si entramos a CapSolver
+    # antes de tiempo, su token de score bajo termina rechazado por Keycloak.
     try:
         page.wait_for_url(
             re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
-            timeout=15000,
+            timeout=45000,
         )
     except PlaywrightTimeoutError:
-        if _captcha_present(page):
-            # _solve_captcha ya somete el form via JS después de inyectar
-            # el token, así que no hace falta re-clickear "Ingresar".
+        # Solo entramos al solver si DE VERDAD hay un challenge visible o
+        # Keycloak ya nos mostró un error — no por el badge invisible que
+        # siempre está ahí.
+        if _real_captcha_challenge(page):
+            log("⚠️  Captcha real detectado (challenge visible o error post-submit). Llamando solver…")
             _solve_captcha(page)
             # Diagnóstico: capturamos qué responde Keycloak después del submit
             # para entender por qué falla (mensaje de error visible).
@@ -357,7 +371,10 @@ def login(page: Page) -> None:
 
 
 def _captcha_present(page: Page) -> bool:
-    """Detecta reCAPTCHA (iframe) o hCaptcha visible en la página actual."""
+    """Detecta reCAPTCHA (iframe) o hCaptcha visible en la página actual.
+    OJO: detecta también el BADGE invisible que siempre está en la página,
+    así que da falsos positivos. Para chequear si hay challenge REAL,
+    usar _real_captcha_challenge."""
     selectors = [
         'iframe[src*="recaptcha"]',
         'iframe[title*="reCAPTCHA" i]',
@@ -377,6 +394,46 @@ def _captcha_present(page: Page) -> bool:
             return True
     except Exception:
         pass
+    return False
+
+
+def _real_captcha_challenge(page: Page) -> bool:
+    """Distingue un challenge real (el modal "click en los semáforos" o el
+    error post-submit "Error en el reCAPTCHA") del badge invisible que el
+    reCAPTCHA siempre planta en la página. Solo en estos casos debemos
+    llamar al solver — si no, conviene seguir esperando el redirect natural.
+
+    Casos que cuentan como "real":
+      - Texto "Error en el reCAPTCHA" visible (Keycloak ya rechazó algo)
+      - iframe del challenge modal visible (el de "elegí imágenes…")
+      - URL sigue en Keycloak sin signs de redirect
+    """
+    # 1) Mensaje de error de Keycloak — claro signo de rechazo.
+    try:
+        if page.get_by_text(re.compile(r"Error en el reCAPTCHA", re.I)).first.is_visible(timeout=500):
+            return True
+    except Exception:
+        pass
+
+    # 2) Modal de challenge visible (el iframe "bframe" del reCAPTCHA challenge,
+    # NO el "anchor" que es solo el badge invisible).
+    try:
+        if page.locator('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]').first.is_visible(timeout=500):
+            return True
+    except Exception:
+        pass
+
+    # 3) Si seguimos en Keycloak y NO hay redirect en curso, asumimos que
+    # algo se trabó.
+    try:
+        if "identidad-gcaba" in page.url:
+            # Esperá un toque más por las dudas
+            page.wait_for_timeout(500)
+            if "identidad-gcaba" in page.url:
+                return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -917,11 +974,20 @@ def _run_once() -> Path:
         page.on("pageerror", lambda err: log(f"[browser pageerror] {err}"))
 
         try:
-            # Fast path: si ya estamos en la bandeja con Exportar visible,
-            # no hacemos login ni navegación (fundamental en modo CDP, donde
-            # la usuaria ya tiene todo listo).
+            # Fast path 1: si ya estamos en la bandeja con Exportar visible,
+            # no hacemos login ni navegación.
+            # Fast path 2: si la URL ya es del backoffice (no Keycloak), estamos
+            # autenticadas — vamos directo a la bandeja sin llamar login() (que
+            # hace goto a la raíz y puede romper la sesión OAuth en curso).
+            already_in_backoffice = (
+                "bacolaborativa-backoffice" in page.url
+                and "identidad-gcaba" not in page.url
+            )
             if _detect_bandeja(page, timeout_s=3.0):
                 log("✓ Ya estoy en la bandeja — skippeando login y navegación.")
+            elif already_in_backoffice:
+                log("✓ Ya autenticada en el backoffice — voy directo a la bandeja sin pasar por login.")
+                go_to_bandeja(page)
             else:
                 login(page)
                 go_to_bandeja(page)
