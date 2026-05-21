@@ -96,12 +96,49 @@ def send_slack_error(text: str) -> None:
 
 
 def send_success_message(added: int, total_in_export: int) -> None:
-    """Notifica a Slack que el pipeline terminó OK."""
+    """Notifica a Slack que el pipeline terminó OK.
+
+    Override del SKIP_SLACK: si hay tickets nuevos (added > 0), FORZAMOS el
+    envío a Slack aunque sea un cron keep-alive 'silencioso'. La intención de
+    SKIP_SLACK en los keep-alives es evitar spam de '0 tickets nuevos' x4 por
+    día — pero cuando hay novedades reales, el equipo tiene que enterarse
+    siempre, no importa el horario."""
     if added == 0:
+        # Sin novedad → respeto el SKIP_SLACK que se haya configurado.
         text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos*. Hay {total_in_export} abiertos actualmente."
-    else:
-        text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
-    send_slack(_with_sheet_link(text))
+        send_slack(_with_sheet_link(text))
+        return
+
+    # Hay tickets nuevos → forzamos el envío ignorando SKIP_SLACK.
+    text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
+    _force_send_slack(_with_sheet_link(text))
+
+
+def _force_send_slack(text: str) -> None:
+    """Manda a Slack ignorando SKIP_SLACK. Usado cuando hay novedades reales
+    que el equipo tiene que ver (tickets nuevos), aunque el cron sea uno de
+    los keep-alives 'silenciosos'."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        payload = json.dumps({
+            "text": text,
+            "username": BOT_NAME,
+            "icon_emoji": SUCCESS_EMOJI,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status >= 300:
+                print(f"[notify] Slack success (forced) respondió {resp.status}")
+            else:
+                print(f"[notify] Slack success (forced) OK — había tickets nuevos")
+    except Exception as e:
+        print(f"[notify] Slack success (forced) falló: {e}")
 
 
 REFRESH_HINT_KEYWORDS = (
