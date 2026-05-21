@@ -1,0 +1,22 @@
+name: Backfill — notificar a Slack 146 tickets del 5am UTC
+# Workflow descartable: manda un mensaje a Slack por los 146 tickets que se
+# subieron en silencio el 2026-05-21 a las 5 UTC. Se borra después de correr.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SHEET_LINK: ${{ vars.SHEET_LINK }}
+        run: |
+          MSG="✅ BA Colaborativa: pipeline OK — *146 tickets nuevos agregados* al Sheets esta madrugada (cron 5 UTC). Hay 397 abiertos actualmente.
+          <$SHEET_LINK|Abrir Sheets>"
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg t "$MSG" '{text: $t, username: "BA Colaborativa Bot", icon_emoji: ":tada:"}')" \
+            "$SLACK_WEBHOOK_URL"
+          echo
