@@ -23,7 +23,9 @@ on:
 jobs:
   download-and-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 min para que MAX_ATTEMPTS=10 entre dentro del presupuesto sin que
+    # GH Actions cancele a mitad de camino.
+    timeout-minutes: 45
 
     env:
       # Credenciales de BA Colaborativa (fallback si las cookies expiraron).
@@ -47,7 +49,10 @@ jobs:
       BROWSER_MODE: cdp
       CDP_URL: http://localhost:9222
       LOGIN_MODE: auto
-      MAX_ATTEMPTS: "5"
+      # 10 intentos por corrida. Después de N fallos consecutivos con captcha,
+      # Keycloak eventualmente skipea y la corrida pasa. 10 chances le dan más
+      # margen para esa "suerte" sin gastarnos más que ~$0.05/día en CapSolver.
+      MAX_ATTEMPTS: "10"
       SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
 
       # Notificación por mail en caso de fallo
