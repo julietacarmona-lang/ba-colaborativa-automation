@@ -96,20 +96,18 @@ def send_slack_error(text: str) -> None:
 
 
 def send_success_message(added: int, total_in_export: int) -> None:
-    """Notifica a Slack que el pipeline terminó OK.
+    """Notifica a Slack solo si hay novedades reales (added > 0).
 
-    Override del SKIP_SLACK: si hay tickets nuevos (added > 0), FORZAMOS el
-    envío a Slack aunque sea un cron keep-alive 'silencioso'. La intención de
-    SKIP_SLACK en los keep-alives es evitar spam de '0 tickets nuevos' x4 por
-    día — pero cuando hay novedades reales, el equipo tiene que enterarse
-    siempre, no importa el horario."""
+    Diseño:
+    - added == 0 → SILENCIO TOTAL. Sin tickets nuevos no hay nada útil que
+      decirle al equipo; "pipeline OK 0 tickets" es ruido.
+    - added > 0 → FORZAMOS el envío a Slack ignorando SKIP_SLACK. Cualquier
+      cron (incluyendo los keep-alives silenciosos) tiene que avisar cuando
+      hay novedades."""
     if added == 0:
-        # Sin novedad → respeto el SKIP_SLACK que se haya configurado.
-        text = f"✅ BA Colaborativa: pipeline OK — *0 tickets nuevos*. Hay {total_in_export} abiertos actualmente."
-        send_slack(_with_sheet_link(text))
+        print(f"[notify] 0 tickets nuevos — silencio (no mando Slack).")
         return
 
-    # Hay tickets nuevos → forzamos el envío ignorando SKIP_SLACK.
     text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
     _force_send_slack(_with_sheet_link(text))
 
