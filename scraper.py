@@ -749,50 +749,126 @@ def _load_saved_filter(page: Page, filter_name: str) -> bool:
         return False
 
 
+def _criterio_rows(page: Page):
+    """Devuelve los <tr> del panel de criterios. Una fila configurada tiene
+    3 ng-select (campo, operador, valor); una recién agregada tiene 2 hasta
+    que se elige el campo. La paginación tiene 1, así filtramos por >=2."""
+    rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
+    return [r for r in rows if r.locator("ng-select").count() >= 2]
+
+
+def _ngselect_pick(page: Page, ng_select, value: str) -> None:
+    """Abre un <ng-select> y elige la opción que coincide con `value`.
+    Tipea para filtrar las opciones (el dropdown de Usuario tiene cientos)."""
+    ng_select.click()
+    page.wait_for_timeout(400)
+    # El input activo del ng-select abierto. Tipeamos para filtrar.
+    typed_ok = False
+    try:
+        active_input = ng_select.locator(".ng-input input").first
+        active_input.fill("")
+        active_input.type(value, delay=30)
+        typed_ok = True
+    except Exception:
+        # Algunos ng-select no tienen input editable; sigue solo con click.
+        pass
+
+    page.wait_for_timeout(700)
+
+    # Buscamos la opción. Match exact-ish primero, después contains.
+    pattern_exact = re.compile(rf"^\s*{re.escape(value)}\s*$", re.I)
+    pattern_loose = re.compile(re.escape(value), re.I)
+
+    option = None
+    for factory in (
+        lambda: page.locator(".ng-option").filter(has_text=pattern_exact).first,
+        lambda: page.get_by_role("option", name=pattern_exact).first,
+        lambda: page.locator(".ng-option").filter(has_text=pattern_loose).first,
+        lambda: page.get_by_role("option", name=pattern_loose).first,
+    ):
+        try:
+            cand = factory()
+            cand.wait_for(state="visible", timeout=3000)
+            option = cand
+            break
+        except Exception:
+            continue
+
+    if option is None:
+        raise RuntimeError(f"No encontré opción '{value}' en el ng-select.")
+
+    option.click()
+    page.wait_for_timeout(400)
+
+
 def _apply_manual_filters(page: Page) -> None:
     """Aplica los criterios sin usar filtro guardado:
-       - Estado general del contacto = Abierto
-       - Usuario asignado = Messina Milton Messina
+       - Criterio 1: Estado general del contacto = Abierto  (default del SPA)
+       - Criterio 2: <FILTRO_CAMPO> = <FILTRO_VALOR>        (configurable)
 
-    Es el fallback cuando el filtro guardado no se encuentra (porque lo
-    renombraron, lo borraron, etc.). Robusto a cambios de nombre del filtro.
-    """
-    # Configurable via env si se quiere personalizar
+    Es el fallback cuando el filtro guardado no se encuentra (porque la
+    cuenta nunca lo creó, lo renombraron, etc.)."""
     estado_valor = os.environ.get("FILTRO_ESTADO", "Abierto")
-    usuario_valor = os.environ.get("FILTRO_USUARIO", "Messina Milton Messina")
+    campo_extra = os.environ.get("FILTRO_CAMPO", "Usuario asignado")
+    valor_extra = os.environ.get("FILTRO_VALOR", "Messina Milton Messina")
 
     log(f"  Criterio 1: Estado general del contacto = {estado_valor}")
-    log(f"  Criterio 2: Usuario asignado = {usuario_valor}")
+    log(f"  Criterio 2: {campo_extra} = {valor_extra}")
 
-    # El form ya viene con un criterio default (Estado=Abierto) en la mayoría
-    # de los casos. Verificamos y, si no, lo seteamos.
-    # Después agregamos el segundo criterio (Usuario asignado = Milton) si no está.
-
-    # Estrategia simple: leer cuántas filas de criterios hay, y agregar/setear
-    # las que falten.
+    # Esperar a que el panel termine de renderizar.
     try:
-        rows = page.locator(
-            'xpath=//*[contains(normalize-space(.), "Criterios de búsqueda")]/following::tr[.//ng-select]'
-        ).all()
-    except Exception:
-        rows = []
+        page.wait_for_selector("tr:has(ng-select)", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(300)
 
+    rows = _criterio_rows(page)
     log(f"  Filas de criterios detectadas: {len(rows)}")
+    if not rows:
+        raise RuntimeError("No detecté ninguna fila de criterios para configurar.")
 
-    # Si ya hay 2 o más filas, asumimos que ya estaban los criterios
-    # (típico cuando se carga un filtro guardado primero o queda de antes).
-    # Si hay 0 o 1, agregamos lo que falte.
-    if len(rows) >= 2:
-        log("  Ya hay 2+ criterios — asumo que están configurados correctamente.")
-        return
+    # Asegurar fila 1 = Estado general del contacto = Abierto (suele venir así).
+    try:
+        labels1 = rows[0].locator(".ng-value-label").all_inner_texts()
+    except Exception:
+        labels1 = []
+    if not (labels1 and "Estado general del contacto" in labels1[0]):
+        try:
+            row1_sels = rows[0].locator("ng-select").all()
+            _ngselect_pick(page, row1_sels[0], "Estado general del contacto")
+            _ngselect_pick(page, row1_sels[2], estado_valor)
+        except Exception as e:
+            log(f"  ⚠️  No pude setear fila 1: {e} — confío en el default.")
 
-    # Si hay 1 fila, asumimos que es Estado=Abierto (default). Agregamos solo Usuario.
-    # Si hay 0, hay que agregar las dos. Por simplicidad, en ambos casos tratamos
-    # de agregar via el botón "+" verde y configurar la nueva fila.
+    # Si solo hay 1 fila, agregamos la 2da con el botón + de esa fila.
+    if len(rows) < 2:
+        log("  Agregando segunda fila con el botón '+' …")
+        add_btn = rows[-1].locator('button.addButton, button[title="Agregar"]').first
+        add_btn.click(force=True)
+        page.wait_for_timeout(500)
+        rows = _criterio_rows(page)
+        log(f"  Filas tras agregar: {len(rows)}")
+        if len(rows) < 2:
+            raise RuntimeError("No pude agregar la segunda fila de criterios.")
 
-    log("  ⚠️  No alcancé a parsear bien los criterios — confío en el default del SPA.")
-    # Si no hubo filtro guardado, el SPA suele venir con Estado=Abierto por default.
-    # Si más adelante hay que setearlo bien, hay que profundizar la implementación.
+    # Llenar fila 2: primero el campo. El ng-select del VALOR aparece recién
+    # después de elegir el campo (es dinámico según el tipo de campo).
+    row2 = rows[1]
+    row2_sels = row2.locator("ng-select").all()
+    if len(row2_sels) < 2:
+        raise RuntimeError(
+            f"Fila 2 no tiene al menos 2 ng-select (tiene {len(row2_sels)})."
+        )
+    _ngselect_pick(page, row2_sels[0], campo_extra)
+    # Esperar a que se renderice el ng-select del valor.
+    page.wait_for_timeout(800)
+    row2_sels = row2.locator("ng-select").all()
+    if len(row2_sels) < 3:
+        # Algunos campos (texto libre) podrían no usar ng-select para el valor.
+        # Hacemos fallback: buscar el último ng-select de la fila o un input.
+        log(f"  ⚠️  Fila 2 sigue con {len(row2_sels)} ng-select después de elegir campo; pruebo con el último.")
+    _ngselect_pick(page, row2_sels[-1], valor_extra)
+    log("  ✓ Criterios configurados manualmente.")
 
 
 def export_all_fields(page: Page) -> None:
