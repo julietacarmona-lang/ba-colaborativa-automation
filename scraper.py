@@ -339,7 +339,68 @@ def login(page: Page) -> None:
         # Keycloak ya nos mostró un error — no por el badge invisible que
         # siempre está ahí.
         if _real_captcha_challenge(page):
-            log("⚠️  Captcha real detectado (challenge visible o error post-submit). Llamando solver…")
+            # SOFT RETRY: Juli observó que cuando salta el error de captcha,
+            # simplemente re-tipear credenciales y submit otra vez suele
+            # funcionar (Keycloak regenera el token invisible). Probamos eso
+            # antes de gastar tokens del solver.
+            log("⚠️  Captcha o error post-submit detectado. Soft retry (re-tipear credenciales)…")
+            soft_retry_ok = False
+            try:
+                user_input2 = _first_visible(
+                    page,
+                    [
+                        lambda: page.get_by_label(re.compile(r"CUIL.?CUIT|Usuario", re.I)),
+                        lambda: page.locator("#username"),
+                        lambda: page.locator('input[name="username"]'),
+                    ],
+                    timeout_ms=5000,
+                )
+                user_input2.click()
+                try:
+                    user_input2.fill("")
+                except Exception:
+                    pass
+                user_input2.type(BA_USER, delay=80)
+                page.wait_for_timeout(600)
+                pw_input2 = _first_visible(
+                    page,
+                    [
+                        lambda: page.get_by_label(re.compile(r"contraseña|password", re.I)),
+                        lambda: page.locator("#password"),
+                        lambda: page.locator('input[name="password"]'),
+                    ],
+                )
+                pw_input2.click()
+                try:
+                    pw_input2.fill("")
+                except Exception:
+                    pass
+                pw_input2.type(BA_PASSWORD, delay=80)
+                page.wait_for_timeout(1500)
+                submit2 = _first_visible(
+                    page,
+                    [
+                        lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
+                        lambda: page.locator('input[type="submit"]'),
+                        lambda: page.locator('button[type="submit"]'),
+                    ],
+                )
+                submit2.click()
+                page.wait_for_url(
+                    re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+                    timeout=45000,
+                )
+                soft_retry_ok = True
+                log("✓ Soft retry funcionó — login OK sin llamar al solver.")
+            except PlaywrightTimeoutError:
+                log("Soft retry no alcanzó — sigue habiendo challenge. Llamando solver…")
+            except Exception as e:
+                log(f"Soft retry tiró excepción ({e}). Llamando solver…")
+
+            if soft_retry_ok:
+                log("Login OK.")
+                return
+
             _solve_captcha(page)
             # Diagnóstico: capturamos qué responde Keycloak después del submit
             # para entender por qué falla (mensaje de error visible).
