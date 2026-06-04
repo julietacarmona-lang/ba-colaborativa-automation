@@ -168,3 +168,27 @@ jobs:
           name: debug-dumps
           path: downloads/
           if-no-files-found: ignore
+
+      - name: Avisar a Slack si el job falló o fue cancelado por timeout
+        # Si el job se cancela (timeout 45min), GitHub mata Python antes de que
+        # mande la noti de error desde adentro. Este step corre fuera del
+        # proceso Python y SÍ avisa al canal de errores (mis-bots-notis).
+        if: ${{ (failure() || cancelled()) && env.SLACK_WEBHOOK_URL_ERROR != '' }}
+        env:
+          SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$STATUS" = "cancelled" ]; then
+            REASON="⏱️ El job se canceló (probablemente timeout 45min — el scraper se quedó colgado)."
+          else
+            REASON="❌ El job falló antes de completar el pipeline."
+          fi
+          TRIGGER="cron \`$SCHEDULE\`"
+          [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
+          TEXT=":rotating_light: *BA Colaborativa cron cayó* ($TRIGGER)\n$REASON\n<$RUN_URL|Ver run en GitHub Actions>"
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" \
+            "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"
