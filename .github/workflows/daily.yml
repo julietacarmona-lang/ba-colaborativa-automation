@@ -1,24 +1,25 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # Corre 4 veces al día (cada 6h) para mantener las cookies de Keycloak vivas
-  # y evitar el captcha (que falla desde IPs de GH Actions). El SPA hace silent
-  # SSO mientras las cookies estén vigentes; si caducan, vuelve al login form
-  # → captcha → fail. Por eso refrescamos seguido.
-  #
-  # Solo la corrida de las 11:00 UTC (8:00 Argentina) manda mensaje a Slack al
-  # equipo. Las otras 3 son keep-alives silenciosas — refrescan cookies y se van.
+  # Corre cada 1 hora (24 veces al día). Más frecuencia mantiene las cookies
+  # de Keycloak vivas y aumenta las chances de que el chain se recupere si
+  # una corrida falla. Slack solo se notifica cuando hay tickets nuevos
+  # (forced en notify.send_success_message), así no spamea cada hora.
   schedule:
-    - cron: "0 11 * * *"  # 8am ARG — corrida "oficial" con Slack
-    - cron: "0 5 * * *"   # 2am ARG — keep-alive silencioso
-    - cron: "0 17 * * *"  # 14h ARG — keep-alive silencioso
-    - cron: "0 23 * * *"  # 20h ARG — keep-alive silencioso
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       skip_slack:
         description: "No mandar mensaje a Slack (útil para pruebas)"
         type: boolean
         default: false
+
+# Si ya hay un run corriendo cuando llega el siguiente cron, lo encola en vez
+# de correrlo en paralelo. Dos logins concurrentes pueden pisar el secret
+# BA_SESSION_JSON o gastar dos slots de CapSolver.
+concurrency:
+  group: ba-colaborativa-pipeline
+  cancel-in-progress: false
 
 jobs:
   download-and-sync:
@@ -65,14 +66,12 @@ jobs:
       # - SLACK_WEBHOOK_URL_ERROR: errores (canal privado del owner).
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
-      # SKIP_SLACK=1 silencia ambos webhooks. Lo activamos en:
-      #  - workflow_dispatch con skip_slack=true (pruebas manuales)
-      #  - cron que NO sea "0 11 * * *" (los 3 keep-alives silenciosos cada 6h)
-      # Así el canal del equipo solo ve la corrida oficial de las 11 UTC,
-      # no las 3 corridas extra que solo refrescan cookies.
-      SKIP_SLACK: >-
-        ${{ ((inputs.skip_slack == true) || (github.event_name == 'schedule' && github.event.schedule != '0 11 * * *'))
-            && '1' || '' }}
+      # SKIP_SLACK=1 silencia el webhook de éxito sin tickets nuevos. Lo
+      # activamos solo en pruebas manuales con skip_slack=true. El cron
+      # cada hora NO lo activa: notify.send_success_message ya se encarga
+      # de mandar a Slack solo cuando added>0 (forced), así que el cron
+      # silencioso no spamea.
+      SKIP_SLACK: ${{ inputs.skip_slack == true && '1' || '' }}
       # Solvers de captcha. Si ambos están, scraper.py prueba CapSolver primero
       # (mejor con reCAPTCHA Enterprise V3 del GCBA) y cae a anti-captcha si falla.
       CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
