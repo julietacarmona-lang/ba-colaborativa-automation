@@ -1,12 +1,11 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # Corre cada 1 hora (24 veces al día). Más frecuencia mantiene las cookies
-  # de Keycloak vivas y aumenta las chances de que el chain se recupere si
-  # una corrida falla. Slack solo se notifica cuando hay tickets nuevos
-  # (forced en notify.send_success_message), así no spamea cada hora.
+  # Cada 6h: mantiene cookies de Keycloak vivas sin generar spam cuando el
+  # chain está roto (captcha persistente). Si se rompe, refrescar la sesión
+  # con ./scripts/refresh-session.sh y opcionalmente subir frecuencia.
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       skip_slack:

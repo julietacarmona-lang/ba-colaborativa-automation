@@ -83,6 +83,13 @@ def log(msg: str) -> None:
     print(f"[scraper] {msg}", flush=True)
 
 
+class CaptchaRejectedError(Exception):
+    """Keycloak rechazó el token del solver con "Error en el reCAPTCHA".
+    Indica que el score del solver no le alcanza al GCBA en este momento —
+    reintentar más veces solo gasta créditos y tiempo. download_tickets()
+    aborta después de 2 ocurrencias consecutivas."""
+
+
 def is_logged_in(page: Page) -> bool:
     """Heurística robusta: estamos logueadas si y solo si la URL es del
     backoffice Y no se ve un input de password (que sería la pantalla de
@@ -405,19 +412,28 @@ def login(page: Page) -> None:
             # Diagnóstico: capturamos qué responde Keycloak después del submit
             # para entender por qué falla (mensaje de error visible).
             page.wait_for_timeout(5000)
+            error_text = ""
             try:
                 error_text = page.evaluate("""
                     () => {
                         const errs = document.querySelectorAll('.kc-feedback-text, .alert, .error, [class*="error"], [class*="Error"]');
                         return Array.from(errs).map(e => e.textContent.trim()).filter(Boolean).join(' | ').substring(0, 500);
                     }
-                """)
+                """) or ""
                 if error_text:
                     log(f"📋 Mensaje de Keycloak post-submit: {error_text}")
                 log(f"📋 URL post-submit: {page.url[:120]}")
             except Exception:
                 pass
             _dump_debug(page, "after_captcha_submit")
+            # Si Keycloak rechazó el token del solver explícitamente, no tiene
+            # sentido seguir esperando 120s ni reintentar 10 veces — el score
+            # de CapSolver simplemente no le alcanza al GCBA. Disparamos una
+            # excepción específica para que download_tickets aborte rápido.
+            if re.search(r"Error en el reCAPTCHA", error_text, re.I):
+                raise CaptchaRejectedError(
+                    "Keycloak rechazó el token del solver (score insuficiente)."
+                )
             page.wait_for_url(
                 re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                 timeout=120000,
@@ -1337,10 +1353,25 @@ def download_tickets() -> Path:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     last_exc: Optional[BaseException] = None
+    captcha_rejections = 0
     for attempt in range(1, MAX_ATTEMPTS + 1):
         log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
         try:
             return _run_once()
+        except CaptchaRejectedError as e:
+            last_exc = e
+            captcha_rejections += 1
+            log(f"Intento {attempt}: captcha rechazado por Keycloak ({captcha_rejections}/2).")
+            if captcha_rejections >= 2:
+                log(
+                    "⛔ 2 captchas rechazados seguidos — abortando run. "
+                    "El solver no está pasando el score del GCBA. "
+                    "Refrescar BA_SESSION_JSON manualmente con scripts/refresh-session.sh "
+                    "para saltear el login."
+                )
+                break
+            log("Reintentando inmediatamente…")
+            time.sleep(1)
         except Exception as e:
             last_exc = e
             log(f"Intento {attempt} falló: {e!r}")
