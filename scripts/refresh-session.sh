@@ -51,7 +51,13 @@ echo "✓ Secret BA_SESSION_JSON actualizado en GitHub."
 rm session.json
 echo "✓ session.json local borrado."
 
-# 6. Disparar workflow
+# 6. Reactivar el workflow si estaba pausado (después de 2 fails seguidos
+#    el step de Slack ERROR lo pausa con `gh workflow disable`). Idempotente.
+$GH workflow enable "Bajada diaria de tickets BA Colaborativa" --repo "$REPO" >/dev/null 2>&1 \
+    && echo "✓ Workflow reactivado (estaba pausado)." \
+    || echo "(Workflow ya estaba activo, sigo.)"
+
+# 7. Disparar workflow
 $GH workflow run "Bajada diaria de tickets BA Colaborativa" --repo "$REPO" >/dev/null
 sleep 4
 RUN=$($GH run list --repo "$REPO" --limit 1 --json databaseId -q '.[0].databaseId')

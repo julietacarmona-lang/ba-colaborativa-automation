@@ -168,10 +168,13 @@ jobs:
           path: downloads/
           if-no-files-found: ignore
 
-      - name: Avisar a Slack solo si es la 2da falla consecutiva
-        # Regla 2026-06-08: 1 falla puede ser GCBA inestable; 2 fallas
-        # seguidas = chain roto, hora de avisar. Anti-spam: después del
-        # aviso por el "2do fallo", silencio hasta que vuelva a andar.
+      - name: Avisar a Slack y, si es 2da falla seguida, pausar el cron
+        # Regla 2026-06-08:
+        #  - CADA error notifica a mis-bots-notis (con emoji según gravedad).
+        #  - 1er fail del chain (anterior fue success) → ⚠️ amarilla, el cron sigue.
+        #  - 2do fail consecutivo → 🚨 roja + se PAUSA el cron (gh workflow disable).
+        #    Cuando Juli arregle y corra refresh-session.sh, el script reactiva
+        #    el cron (gh workflow enable + run).
         # Si el job se canceló (timeout 45min), GitHub mata Python antes
         # de que mande la noti desde adentro; este step corre afuera.
         if: ${{ (failure() || cancelled()) && env.SLACK_WEBHOOK_URL_ERROR != '' }}
@@ -183,26 +186,12 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
+          WORKFLOW_NAME: ${{ github.workflow }}
         run: |
-          # Miro las 2 últimas conclusiones ANTES del run actual.
-          # PREV = la inmediatamente anterior; PREV_PREV = la dos antes.
-          # Regla: notifico solo si PREV != success (este es el 2do fail)
-          # Y PREV_PREV == success (el anterior fue el primer fail).
-          # Eso evita: (a) ruido por 1 fail aislado y (b) spam si ya avisé.
-          CONCLS=$(gh run list --workflow="${{ github.workflow }}" --branch=main --limit=3 --json conclusion --jq '[.[].conclusion // "none"] | join(" ")' 2>/dev/null || echo "none none none")
-          # CONCLS[0] = ACTUAL (este run), CONCLS[1] = previo, CONCLS[2] = pre-previo
-          PREV=$(echo "$CONCLS" | awk '{print $2}')
-          PREV_PREV=$(echo "$CONCLS" | awk '{print $3}')
-          echo "Conclusiones recientes (actual, prev, prev_prev): $CONCLS"
-          if [ "$PREV" = "success" ] || [ "$PREV" = "none" ]; then
-            echo "Run anterior fue OK (o sin historia). Es solo 1 fall — puede ser GCBA caído un toque. No notifico todavía."
-            exit 0
-          fi
-          if [ "$PREV_PREV" != "success" ] && [ "$PREV_PREV" != "none" ]; then
-            echo "El pre-anterior tampoco fue success — ya hubo aviso. Anti-spam: no notifico."
-            exit 0
-          fi
-          # Este es el 2do fail consecutivo, el primer aviso. Diagnostico el tipo.
+          # Conclusión del run inmediato anterior (el actual no aparece todavía en la lista).
+          PREV=$(gh run list --workflow="$WORKFLOW_NAME" --branch=main --limit=2 --json conclusion --jq '.[1].conclusion // "none"' 2>/dev/null || echo "none")
+          echo "Conclusión del run anterior: $PREV"
+          # Diagnóstico según el log del run.
           LOG=$(gh run view "$RUN_ID" --log 2>&1 | head -2000 || echo "")
           DIAG="❓ No pude inferir el tipo de fallo. Revisá el run."
           ACCION="Mirá el log del run para más pistas."
@@ -219,14 +208,26 @@ jobs:
             DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
             ACCION="Avisame para que investigue."
           fi
-          if [ "$STATUS" = "cancelled" ]; then
-            HEADER="⏱️ *BA Colaborativa: 2 corridas seguidas fallaron (la última por timeout 45min)*"
-          else
-            HEADER="🚨 *BA Colaborativa: 2 corridas seguidas fallaron*"
-          fi
           TRIGGER="cron \`$SCHEDULE\`"
           [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
-          TEXT="$HEADER ($TRIGGER)\n*Diagnóstico:* $DIAG\n*Qué hacer:* $ACCION\n<$RUN_URL|Ver run en GitHub Actions>\n_(No te voy a avisar de cada corrida fallida — calla hasta que vuelva a andar.)_"
+          # Severidad según si es el 1er fail o el 2do consecutivo.
+          if [ "$PREV" = "success" ] || [ "$PREV" = "none" ]; then
+            # 1er fail del chain: alerta amarilla, no pausamos.
+            EMOJI="⚠️"
+            HEADER="⚠️ *BA Colaborativa: corrida falló* ($TRIGGER)"
+            EXTRA="_(Es la 1ra falla — el cron sigue corriendo. Si la próxima también falla, paso el cron a pausa y te aviso con alerta roja.)_"
+          else
+            # 2da+ falla consecutiva: alerta roja + pausar el cron.
+            EMOJI="🚨"
+            HEADER="🚨 *BA Colaborativa: 2 corridas seguidas fallaron — PAUSANDO el cron*"
+            # Pausar el cron para que no siga corriendo en loop.
+            if gh workflow disable "$WORKFLOW_NAME" --repo "${{ github.repository }}" 2>&1; then
+              EXTRA="_(El cron quedó **pausado**. Para reactivarlo después de arreglar: corré \`./scripts/refresh-session.sh\` (lo reactiva solo) o desde la UI de GitHub Actions.)_"
+            else
+              EXTRA="_(Intenté pausar el cron pero el comando falló. Pausalo manualmente desde Actions → Workflows → ... → Disable workflow.)_"
+            fi
+          fi
+          TEXT="$HEADER\n*Diagnóstico:* $DIAG\n*Qué hacer:* $ACCION\n<$RUN_URL|Ver run en GitHub Actions>\n$EXTRA"
           curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" \
             "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"
