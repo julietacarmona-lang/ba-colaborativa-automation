@@ -1292,26 +1292,27 @@ def _connect_cdp(p):
                     log(f"✓ Inyecté {len(cookies)} cookies en el contexto CDP.")
                 except Exception as e:
                     log(f"⚠️  add_cookies falló: {e}")
-            # localStorage/sessionStorage: hay que navegar a cada origen y setear via JS
-            tmp_page = context.pages[0] if context.pages else context.new_page()
+            # localStorage: usamos add_init_script así el SPA tiene el JWT
+            # ANTES de que su bootstrap chequee si está autenticado. Si lo
+            # hiciéramos via page.goto + setItem, el SPA ya habría arrancado
+            # sin JWT y redirigido a Keycloak antes de llegar a setearlo.
             for origin_entry in origins:
                 origin = origin_entry.get("origin")
                 items = origin_entry.get("localStorage", []) or []
                 if not origin or not items:
                     continue
                 try:
-                    tmp_page.goto(origin, wait_until="domcontentloaded", timeout=15000)
-                    tmp_page.evaluate(
-                        """(items) => {
-                            for (const it of items) {
-                                try { localStorage.setItem(it.name, it.value); } catch(e) {}
-                            }
-                        }""",
-                        items,
+                    init_script = (
+                        "(() => { if (window.location.origin === "
+                        + json.dumps(origin)
+                        + ") { const items = "
+                        + json.dumps(items)
+                        + "; for (const it of items) { try { localStorage.setItem(it.name, it.value); } catch(e) {} } } })();"
                     )
-                    log(f"✓ Inyecté {len(items)} entradas localStorage en {origin[:60]}")
+                    context.add_init_script(init_script)
+                    log(f"✓ add_init_script para {len(items)} entradas localStorage en {origin[:60]}")
                 except Exception as e:
-                    log(f"⚠️  No pude inyectar localStorage en {origin[:60]}: {e}")
+                    log(f"⚠️  add_init_script falló para {origin[:60]}: {e}")
 
     def cleanup():
         # NO cerramos Chrome — es el browser de la usuaria. Solo desconectamos.
