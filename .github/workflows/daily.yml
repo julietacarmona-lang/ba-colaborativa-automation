@@ -198,22 +198,35 @@ jobs:
           # Conclusión del run inmediato anterior (el actual no aparece todavía en la lista).
           PREV=$(gh run list --workflow="$WORKFLOW_NAME" --branch=main --limit=2 --json conclusion --jq '.[1].conclusion // "none"' 2>/dev/null || echo "none")
           echo "Conclusión del run anterior: $PREV"
-          # Diagnóstico según el log del run.
-          LOG=$(gh run view "$RUN_ID" --log 2>&1 | head -2000 || echo "")
+          # Diagnóstico priorizando señales rápidas (estado + duración), después patrón en log.
           DIAG="❓ No pude inferir el tipo de fallo. Revisá el run."
           ACCION="Mirá el log del run para más pistas."
-          if echo "$LOG" | grep -q "Usuario o contraseña incorrectos"; then
-            DIAG="🔐 Keycloak rechazó las credenciales — probablemente cambió la password de Cecilia."
-            ACCION="Actualizá el secret con: \`gh secret set BA_PASSWORD --repo ${{ github.repository }}\`"
-          elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal Server|backend.+ 5[0-9][0-9]"; then
-            DIAG="🌩️ Backend del GCBA caído (5xx). No es nuestro problema."
-            ACCION="Esperá 1-2h. La próxima corrida del cron probablemente pase."
-          elif echo "$LOG" | grep -qE "captchas? rechazado|Error en el reCAPTCHA|CapSolver"; then
-            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score desde IP de GitHub."
-            ACCION="Refrescá la sesión: \`cd ~/Automatizacion-bajada-tickets-sinigep && ./scripts/refresh-session.sh\`"
-          elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.+selector|ng-select|addButton|modal.+Exportar"; then
-            DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
-            ACCION="Avisame para que investigue."
+          # Duración del job en segundos (este job, no del run completo)
+          DUR=$(gh run view "$RUN_ID" --json jobs --jq '.jobs[0] | (.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)' 2>/dev/null || echo "0")
+          echo "Duración job: ${DUR}s, status: $STATUS"
+          if [ "$STATUS" = "cancelled" ]; then
+            DIAG="⏱️ El job se canceló (timeout 45min — el scraper se quedó colgado en algún paso)."
+            ACCION="Mirá el log para ver dónde se trabó. Si pasó muchas veces seguidas, refrescá la sesión: \`./scripts/refresh-session.sh\`"
+          elif [ "${DUR}" -lt 600 ] 2>/dev/null && [ "${DUR}" != "0" ]; then
+            # < 10min con failure → casi seguro early abort por captcha rechazado
+            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score desde IP de GitHub. (Abortado rápido por early abort.)"
+            ACCION="Esto es intermitente; suele resolverse solo en alguna corrida cercana. Si persiste 4+ runs, refrescá: \`./scripts/refresh-session.sh\`"
+          else
+            # Fallback: analizar log
+            LOG=$(gh run view "$RUN_ID" --log 2>&1 || echo "")
+            if echo "$LOG" | grep -q "Usuario o contraseña incorrectos"; then
+              DIAG="🔐 Keycloak rechazó las credenciales — probablemente cambió la password de Cecilia."
+              ACCION="Actualizá el secret con: \`gh secret set BA_PASSWORD --repo ${{ github.repository }}\`"
+            elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal Server|backend.+ 5[0-9][0-9]"; then
+              DIAG="🌩️ Backend del GCBA caído (5xx). No es nuestro problema."
+              ACCION="Esperá 1-2h. La próxima corrida del cron probablemente pase."
+            elif echo "$LOG" | grep -qE "Error en el reCAPTCHA|captchas? rechazado"; then
+              DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score."
+              ACCION="Es intermitente. Si persiste 4+ runs, refrescá la sesión: \`./scripts/refresh-session.sh\`"
+            elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.+selector|ng-select|addButton|modal.+Exportar"; then
+              DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
+              ACCION="Avisame para que investigue."
+            fi
           fi
           TRIGGER="cron \`$SCHEDULE\`"
           [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
