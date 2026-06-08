@@ -33,13 +33,30 @@ def run() -> dict:
     if not spreadsheet_id:
         raise RuntimeError("Falta SPREADSHEET_ID en .env / variables de entorno.")
 
-    log("1/2 — Descargando tickets desde BA Colaborativa…")
+    log("1/3 — Descargando tickets desde BA Colaborativa…")
     export_path: Path = scraper.download_tickets()
     log(f"Export: {export_path}")
 
-    log("2/2 — Mergeando contra Google Sheets…")
+    log("2/3 — Mergeando contra Google Sheets…")
     stats = update_sheets.update_sheets(export_path, spreadsheet_id)
     log(f"✓ {stats['added']} tickets nuevos agregados (export: {stats['export_total']}).")
+
+    # 3. Adjuntos: opt-in via PROCESAR_ADJUNTOS=1 hasta que esté testeado en CI.
+    # Reusa la sesión del scraper en el Chrome dedicado (BROWSER_MODE=cdp). Si
+    # falla, no rompe el pipeline — solo logguea.
+    if os.environ.get("PROCESAR_ADJUNTOS", "").strip() in ("1", "true", "yes"):
+        log("3/3 — Procesando URLs de adjuntos…")
+        try:
+            import update_adjuntos
+            adj_stats = update_adjuntos.process_adjuntos(export_path, spreadsheet_id)
+            log(f"✓ adjuntos: {adj_stats}")
+            stats["adjuntos"] = adj_stats
+        except Exception as e:
+            log(f"⚠️  adjuntos falló (no rompe el pipeline): {e!r}")
+            stats["adjuntos_error"] = repr(e)
+    else:
+        log("3/3 — Adjuntos: skip (poner PROCESAR_ADJUNTOS=1 para activar).")
+
     return stats
 
 
