@@ -346,13 +346,18 @@ def login(page: Page) -> None:
         # Keycloak ya nos mostró un error — no por el badge invisible que
         # siempre está ahí.
         if _real_captcha_challenge(page):
-            # SOFT RETRY: Juli observó que cuando salta el error de captcha,
-            # simplemente re-tipear credenciales y submit otra vez suele
-            # funcionar (Keycloak regenera el token invisible). Probamos eso
-            # antes de gastar tokens del solver.
-            log("⚠️  Captcha o error post-submit detectado. Soft retry (re-tipear credenciales)…")
-            soft_retry_ok = False
+            # HARD RELOAD retry: Juli observó que "Error en el reCAPTCHA"
+            # muchas veces es el token invisible que expiró por demorar
+            # mucho en submitir, NO un challenge real. La solución que ella
+            # hace a mano es refrescar la página → form fresco → token
+            # invisible nuevo → login pasa sin captcha. Replicamos eso
+            # antes de gastar créditos del solver. Re-tipear sobre el mismo
+            # form (lo que hacíamos antes) heredaba el token vencido.
+            log("⚠️  Error en el reCAPTCHA / no redirect. Hard reload + login fresh…")
+            hard_retry_ok = False
             try:
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)  # dejar que reCAPTCHA Enterprise genere su token natural
                 user_input2 = _first_visible(
                     page,
                     [
@@ -360,15 +365,11 @@ def login(page: Page) -> None:
                         lambda: page.locator("#username"),
                         lambda: page.locator('input[name="username"]'),
                     ],
-                    timeout_ms=5000,
+                    timeout_ms=15000,
                 )
                 user_input2.click()
-                try:
-                    user_input2.fill("")
-                except Exception:
-                    pass
                 user_input2.type(BA_USER, delay=80)
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(800)
                 pw_input2 = _first_visible(
                     page,
                     [
@@ -378,10 +379,6 @@ def login(page: Page) -> None:
                     ],
                 )
                 pw_input2.click()
-                try:
-                    pw_input2.fill("")
-                except Exception:
-                    pass
                 pw_input2.type(BA_PASSWORD, delay=80)
                 page.wait_for_timeout(1500)
                 submit2 = _first_visible(
@@ -397,14 +394,14 @@ def login(page: Page) -> None:
                     re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
                     timeout=45000,
                 )
-                soft_retry_ok = True
-                log("✓ Soft retry funcionó — login OK sin llamar al solver.")
+                hard_retry_ok = True
+                log("✓ Hard reload retry funcionó — login OK sin llamar al solver.")
             except PlaywrightTimeoutError:
-                log("Soft retry no alcanzó — sigue habiendo challenge. Llamando solver…")
+                log("Hard reload retry no alcanzó — challenge persistente. Llamando solver…")
             except Exception as e:
-                log(f"Soft retry tiró excepción ({e}). Llamando solver…")
+                log(f"Hard reload retry tiró excepción ({e}). Llamando solver…")
 
-            if soft_retry_ok:
+            if hard_retry_ok:
                 log("Login OK.")
                 return
 
