@@ -70,23 +70,91 @@ def _extract_urls_from_detail(page) -> List[str]:
     return unique
 
 
+def _search_by_numero(page, numero: str) -> None:
+    """En la bandeja: limpia criterios, agrega 'Número = {numero}', click Buscar.
+    Después de esto, la grilla queda con (idealmente) solo esa fila."""
+    # Asegurar panel de criterios expandido
+    buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
+    if not buscar.is_visible(timeout=1500):
+        try:
+            page.get_by_text(re.compile(r"Criterios de b[uú]squeda", re.I)).first.click(force=True)
+            time.sleep(1)
+        except Exception:
+            pass
+
+    # Click en 'Limpiar' para resetear criterios previos
+    try:
+        page.get_by_role("button", name=re.compile(r"^\s*limpiar\s*$", re.I)).first.click(force=True)
+        time.sleep(1)
+    except Exception:
+        pass
+
+    # La grilla tiene una fila default vacía con 3 ng-select (campo/operador/valor).
+    rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
+    rows = [r for r in rows if r.locator("ng-select").count() >= 2]
+    if not rows:
+        raise RuntimeError("no detecté filas de criterios")
+
+    # Configurar la primera fila con Número = numero
+    row1_sels = rows[0].locator("ng-select").all()
+    # 1) campo
+    row1_sels[0].click()
+    page.wait_for_timeout(400)
+    try:
+        active = row1_sels[0].locator(".ng-input input").first
+        active.fill("")
+        active.type("Número", delay=20)
+    except Exception:
+        pass
+    page.wait_for_timeout(600)
+    page.locator(".ng-option").filter(has_text=re.compile(r"^\s*N[uú]mero\s*$", re.I)).first.click()
+    page.wait_for_timeout(700)
+
+    # 2) valor — re-leer (puede tener ahora 2 o 3 ng-select)
+    row1_sels = rows[0].locator("ng-select").all()
+    # El último ng-select es el del valor; debería ser un input editable
+    val_sel = row1_sels[-1]
+    val_sel.click()
+    page.wait_for_timeout(300)
+    try:
+        # Algunos campos numéricos son inputs simples, no ng-select; probemos ambos
+        active = val_sel.locator(".ng-input input").first
+        active.fill("")
+        active.type(numero, delay=20)
+    except Exception:
+        # Fallback: input genérico dentro de la fila
+        try:
+            inp = rows[0].locator("input[type='text'], input:not([type])").last
+            inp.fill(numero)
+        except Exception:
+            pass
+    page.wait_for_timeout(500)
+
+    # Buscar
+    buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
+    buscar.wait_for(timeout=8000)
+    buscar.click(force=True)
+    # Esperar resultados
+    time.sleep(4)
+
+
 def _process_one_ticket(page, numero: str) -> List[str]:
-    """En la bandeja: selecciona la fila con `numero`, click 'Ver detalles',
+    """Filtra la bandeja por `numero`, abre el detalle del único resultado,
     extrae URLs, vuelve a la bandeja."""
-    # La grilla es un <datatable> de Angular: celdas son <datatable-body-cell>.
-    # 1) Click selecciona la fila.
+    _search_by_numero(page, numero)
+
+    # Verificar que aparece la celda con el número (la única fila)
     cell = page.locator("datatable-body-cell").filter(has_text=numero).first
-    cell.wait_for(state="visible", timeout=8000)
+    cell.wait_for(state="visible", timeout=10000)
     cell.click()
-    # 2) Click en 'Ver detalles' → navega al detalle /contacto/consulta/{id}.
+    # Click en 'Ver detalles' → navega al detalle
     page.get_by_role("link", name=re.compile(r"^\s*ver detalles\s*$", re.I)).first.click(force=True)
     page.wait_for_url(re.compile(r"/contacto/consulta/"), timeout=15000)
-    # Esperar a que el SPA cargue (Angular suele tardar)
     time.sleep(4)
 
     urls = _extract_urls_from_detail(page)
 
-    # Volver a la bandeja (preserva resultados de búsqueda)
+    # Volver a la bandeja
     try:
         page.go_back(wait_until="domcontentloaded", timeout=15000)
     except Exception:
