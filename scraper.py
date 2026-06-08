@@ -1258,10 +1258,13 @@ def _run_once() -> Path:
 def _connect_cdp(p):
     """Se conecta a un Chrome ya corriendo con --remote-debugging-port.
 
-    En CI, ese Chrome arranca en about:blank y sin cookies. Si tenemos
-    BA_SESSION_JSON, lo inyectamos: cookies via context.add_cookies y
-    localStorage/sessionStorage navegando a cada origen y ejecutando JS.
-    Así el SPA arranca con la sesión y skip totalmente el login form.
+    Nota (2026-06-08): probamos inyectar BA_SESSION_JSON acá (cookies via
+    add_cookies + localStorage via add_init_script) para saltear el login
+    en CI. El SPA arrancaba autenticado (cookies bastan para Keycloak silent
+    SSO), pero TODOS los XHRs al backend GCS daban 401 — el id_token de
+    Cecilia desde la IP de su Mac no es aceptado por el backend desde la
+    IP de GitHub Actions, aunque el sessionId del JWT no haya expirado.
+    El intento quedó en commits 7350426 y 0e96b1b; revertidos en este file.
     """
     log(f"Conectando por CDP a {CDP_URL}…")
     try:
@@ -1275,44 +1278,6 @@ def _connect_cdp(p):
         raise RuntimeError("El Chrome al que conectaste no tiene contextos activos.")
     context = browser.contexts[0]
     log(f"✓ Conectado. {len(context.pages)} pestaña(s) abierta(s).")
-
-    if BA_SESSION_JSON:
-        try:
-            storage_state = json.loads(BA_SESSION_JSON)
-        except Exception as e:
-            log(f"⚠️  BA_SESSION_JSON inválido: {e}. Sigo sin inyectar sesión.")
-            storage_state = None
-
-        if storage_state:
-            cookies = storage_state.get("cookies", []) or []
-            origins = storage_state.get("origins", []) or []
-            if cookies:
-                try:
-                    context.add_cookies(cookies)
-                    log(f"✓ Inyecté {len(cookies)} cookies en el contexto CDP.")
-                except Exception as e:
-                    log(f"⚠️  add_cookies falló: {e}")
-            # localStorage: usamos add_init_script así el SPA tiene el JWT
-            # ANTES de que su bootstrap chequee si está autenticado. Si lo
-            # hiciéramos via page.goto + setItem, el SPA ya habría arrancado
-            # sin JWT y redirigido a Keycloak antes de llegar a setearlo.
-            for origin_entry in origins:
-                origin = origin_entry.get("origin")
-                items = origin_entry.get("localStorage", []) or []
-                if not origin or not items:
-                    continue
-                try:
-                    init_script = (
-                        "(() => { if (window.location.origin === "
-                        + json.dumps(origin)
-                        + ") { const items = "
-                        + json.dumps(items)
-                        + "; for (const it of items) { try { localStorage.setItem(it.name, it.value); } catch(e) {} } } })();"
-                    )
-                    context.add_init_script(init_script)
-                    log(f"✓ add_init_script para {len(items)} entradas localStorage en {origin[:60]}")
-                except Exception as e:
-                    log(f"⚠️  add_init_script falló para {origin[:60]}: {e}")
 
     def cleanup():
         # NO cerramos Chrome — es el browser de la usuaria. Solo desconectamos.

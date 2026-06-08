@@ -1,11 +1,12 @@
 name: Bajada diaria de tickets BA Colaborativa
 
 on:
-  # Cada 6h: mantiene cookies de Keycloak vivas sin generar spam cuando el
-  # chain está roto (captcha persistente). Si se rompe, refrescar la sesión
-  # con ./scripts/refresh-session.sh y opcionalmente subir frecuencia.
+  # Cada 1h: máxima frecuencia para mantener cookies vivas y aumentar
+  # chances de recuperación. Pareado con anti-spam abajo, así si el
+  # chain se rompe NO satura mis-bots-notis (solo avisa el primer
+  # fallo del chain).
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       skip_slack:
@@ -168,17 +169,28 @@ jobs:
           if-no-files-found: ignore
 
       - name: Avisar a Slack si el job falló o fue cancelado por timeout
-        # Si el job se cancela (timeout 45min), GitHub mata Python antes de que
-        # mande la noti de error desde adentro. Este step corre fuera del
-        # proceso Python y SÍ avisa al canal de errores (mis-bots-notis).
+        # Anti-spam: solo notificar si el run ANTERIOR del workflow fue
+        # success. Así, cuando el chain se rompe, avisa la PRIMERA vez y
+        # después calla hasta que vuelva a andar. Si el job se cancela
+        # (timeout 45min), GitHub mata Python antes de que mande la noti
+        # desde adentro; por eso este step corre fuera del proceso Python.
         if: ${{ (failure() || cancelled()) && env.SLACK_WEBHOOK_URL_ERROR != '' }}
         env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
           STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
+          # Chequeo si el run inmediato anterior fue success (=primer fallo del chain).
+          # Si el anterior NO fue success, asumimos que ya se avisó y callamos.
+          PREV_STATUS=$(gh run list --workflow="${{ github.workflow }}" --branch=main --limit=2 --json conclusion --jq '.[1].conclusion // "unknown"' 2>/dev/null || echo "unknown")
+          echo "Conclusión del run anterior: $PREV_STATUS"
+          if [ "$PREV_STATUS" != "success" ] && [ "$PREV_STATUS" != "unknown" ]; then
+            echo "El run anterior también falló ($PREV_STATUS). No notifico para evitar spam."
+            exit 0
+          fi
           if [ "$STATUS" = "cancelled" ]; then
             REASON="⏱️ El job se canceló (probablemente timeout 45min — el scraper se quedó colgado)."
           else
@@ -186,7 +198,7 @@ jobs:
           fi
           TRIGGER="cron \`$SCHEDULE\`"
           [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
-          TEXT=":rotating_light: *BA Colaborativa cron cayó* ($TRIGGER)\n$REASON\n<$RUN_URL|Ver run en GitHub Actions>"
+          TEXT=":rotating_light: *BA Colaborativa cron cayó* ($TRIGGER)\n$REASON\nPróximos crons también van a fallar hasta que se destrabe — no te van a llegar más notis hasta que vuelva a andar.\n<$RUN_URL|Ver run en GitHub Actions>"
           curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" \
             "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"
