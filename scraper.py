@@ -1350,10 +1350,11 @@ def download_tickets() -> Path:
     # con más espera (a ver si Keycloak/Google aflojan después de varios
     # minutos). Si los 5 fallan, dejamos que el próximo cron (1h) lo intente.
     # La lógica del workflow corta el cron si 2 runs seguidos fallan.
-    MAX_CAPTCHA_REJECTIONS = 5
-    # Waits ANTES del próximo intento: i-ésimo elemento se usa después del
-    # intento (i+1). Total acumulado: 15+45+90+120 = 270s ≈ 4.5min de waits.
-    CAPTCHA_RETRY_WAITS = [15, 45, 90, 120]
+    MAX_CAPTCHA_REJECTIONS = 4
+    # Waits ANTES del próximo intento. Total acumulado: 15+30+60 = 105s ≈ 2min.
+    # Los datos de 2026-06-08 muestran que el 99% de los logins exitosos pasan
+    # en intento 1 o 2; un wait largo en intentos 3+ rara vez compensa.
+    CAPTCHA_RETRY_WAITS = [15, 30, 60]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
         try:
