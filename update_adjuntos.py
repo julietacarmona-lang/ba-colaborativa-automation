@@ -57,6 +57,17 @@ def _extract_urls_from_detail(page) -> List[str]:
     items = accordion.locator(".image-wrapper").all()
     urls: List[str] = []
     for item in items:
+        # Caso imagen: el wrapper ya tiene <img src=cdn.../> visible.
+        # Lo capturamos sin hacer click (más rápido y robusto).
+        try:
+            img_src = item.locator("img").first.get_attribute("src", timeout=1500)
+            if img_src and "cdn.buenosaires" in img_src:
+                urls.append(img_src)
+                continue
+        except Exception:
+            pass
+
+        # Caso PDF u otro: hay un mat-icon, hay que clickear para abrir popup.
         try:
             with page.expect_popup(timeout=20000) as popup_info:
                 item.click()

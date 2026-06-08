@@ -61,7 +61,7 @@ jobs:
       # (cada uno toma ~30s: navegar al detalle, click adjunto, volver).
       # Empezamos con 2 como prueba; subir a 20 cuando confirmemos OK.
       PROCESAR_ADJUNTOS: "1"
-      ADJUNTOS_MAX_TICKETS: "2"
+      ADJUNTOS_MAX_TICKETS: "20"
 
       # Notificación por mail en caso de fallo
       ALERT_TO_EMAIL: julieta.carmona@educabot.com
