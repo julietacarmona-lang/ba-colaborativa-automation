@@ -1346,12 +1346,14 @@ def download_tickets() -> Path:
     last_exc: Optional[BaseException] = None
     captcha_rejections = 0
     # Permitimos hasta 5 captchas rechazados consecutivos dentro de un mismo
-    # run; entre cada intento esperamos 60s a ver si Keycloak/Google aflojan.
-    # Razón: a veces "después de unos minutos" sí pasa, aunque las primeras
-    # veces rechace. Si 5 seguidos no pasan, dejamos que el próximo cron (1h)
-    # lo intente. La lógica del workflow corta el cron si 2 runs seguidos fallan.
+    # run; los primeros pegados (rápido por si fue solo timing), los últimos
+    # con más espera (a ver si Keycloak/Google aflojan después de varios
+    # minutos). Si los 5 fallan, dejamos que el próximo cron (1h) lo intente.
+    # La lógica del workflow corta el cron si 2 runs seguidos fallan.
     MAX_CAPTCHA_REJECTIONS = 5
-    CAPTCHA_RETRY_WAIT = 60
+    # Waits ANTES del próximo intento: i-ésimo elemento se usa después del
+    # intento (i+1). Total acumulado: 15+45+90+120 = 270s ≈ 4.5min de waits.
+    CAPTCHA_RETRY_WAITS = [15, 45, 90, 120]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
         try:
@@ -1368,8 +1370,9 @@ def download_tickets() -> Path:
                     "el workflow se pausa automáticamente."
                 )
                 break
-            log(f"Esperando {CAPTCHA_RETRY_WAIT}s antes de reintentar (Google a veces afloja)…")
-            time.sleep(CAPTCHA_RETRY_WAIT)
+            wait_s = CAPTCHA_RETRY_WAITS[min(captcha_rejections - 1, len(CAPTCHA_RETRY_WAITS) - 1)]
+            log(f"Esperando {wait_s}s antes de reintentar (escalonado: los primeros pegados, después más espacio)…")
+            time.sleep(wait_s)
         except Exception as e:
             last_exc = e
             log(f"Intento {attempt} falló: {e!r}")
