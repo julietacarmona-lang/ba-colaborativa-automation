@@ -56,6 +56,13 @@ jobs:
       MAX_ATTEMPTS: "10"
       SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
 
+      # Feature 2026-06-08: procesar URLs de adjuntos al final del cron.
+      # ADJUNTOS_MAX_TICKETS limita cuántos tickets se procesan por corrida
+      # (cada uno toma ~30s: navegar al detalle, click adjunto, volver).
+      # Empezamos con 2 como prueba; subir a 20 cuando confirmemos OK.
+      PROCESAR_ADJUNTOS: "1"
+      ADJUNTOS_MAX_TICKETS: "2"
+
       # Notificación por mail en caso de fallo
       ALERT_TO_EMAIL: julieta.carmona@educabot.com
       # Configurar uno de los dos backends de mail:

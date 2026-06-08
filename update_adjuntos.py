@@ -71,13 +71,15 @@ def _extract_urls_from_detail(page) -> List[str]:
 
 
 def _process_one_ticket(page, numero: str) -> List[str]:
-    """En la bandeja: clickea la fila con `numero`, espera el detalle,
+    """En la bandeja: selecciona la fila con `numero`, click 'Ver detalles',
     extrae URLs, vuelve a la bandeja."""
-    # La grilla tiene una celda <td> con el número del ticket.
-    cell = page.locator("table tbody tr td").filter(has_text=numero).first
+    # La grilla es un <datatable> de Angular: celdas son <datatable-body-cell>.
+    # 1) Click selecciona la fila.
+    cell = page.locator("datatable-body-cell").filter(has_text=numero).first
     cell.wait_for(state="visible", timeout=8000)
     cell.click()
-    # El click navega al detalle: /contacto/consulta/{id}
+    # 2) Click en 'Ver detalles' → navega al detalle /contacto/consulta/{id}.
+    page.get_by_role("link", name=re.compile(r"^\s*ver detalles\s*$", re.I)).first.click(force=True)
     page.wait_for_url(re.compile(r"/contacto/consulta/"), timeout=15000)
     # Esperar a que el SPA cargue (Angular suele tardar)
     time.sleep(4)
