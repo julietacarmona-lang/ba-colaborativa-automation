@@ -1256,7 +1256,13 @@ def _run_once() -> Path:
 
 
 def _connect_cdp(p):
-    """Se conecta a un Chrome ya corriendo con --remote-debugging-port."""
+    """Se conecta a un Chrome ya corriendo con --remote-debugging-port.
+
+    En CI, ese Chrome arranca en about:blank y sin cookies. Si tenemos
+    BA_SESSION_JSON, lo inyectamos: cookies via context.add_cookies y
+    localStorage/sessionStorage navegando a cada origen y ejecutando JS.
+    Así el SPA arranca con la sesión y skip totalmente el login form.
+    """
     log(f"Conectando por CDP a {CDP_URL}…")
     try:
         browser = p.chromium.connect_over_cdp(CDP_URL)
@@ -1269,6 +1275,43 @@ def _connect_cdp(p):
         raise RuntimeError("El Chrome al que conectaste no tiene contextos activos.")
     context = browser.contexts[0]
     log(f"✓ Conectado. {len(context.pages)} pestaña(s) abierta(s).")
+
+    if BA_SESSION_JSON:
+        try:
+            storage_state = json.loads(BA_SESSION_JSON)
+        except Exception as e:
+            log(f"⚠️  BA_SESSION_JSON inválido: {e}. Sigo sin inyectar sesión.")
+            storage_state = None
+
+        if storage_state:
+            cookies = storage_state.get("cookies", []) or []
+            origins = storage_state.get("origins", []) or []
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                    log(f"✓ Inyecté {len(cookies)} cookies en el contexto CDP.")
+                except Exception as e:
+                    log(f"⚠️  add_cookies falló: {e}")
+            # localStorage/sessionStorage: hay que navegar a cada origen y setear via JS
+            tmp_page = context.pages[0] if context.pages else context.new_page()
+            for origin_entry in origins:
+                origin = origin_entry.get("origin")
+                items = origin_entry.get("localStorage", []) or []
+                if not origin or not items:
+                    continue
+                try:
+                    tmp_page.goto(origin, wait_until="domcontentloaded", timeout=15000)
+                    tmp_page.evaluate(
+                        """(items) => {
+                            for (const it of items) {
+                                try { localStorage.setItem(it.name, it.value); } catch(e) {}
+                            }
+                        }""",
+                        items,
+                    )
+                    log(f"✓ Inyecté {len(items)} entradas localStorage en {origin[:60]}")
+                except Exception as e:
+                    log(f"⚠️  No pude inyectar localStorage en {origin[:60]}: {e}")
 
     def cleanup():
         # NO cerramos Chrome — es el browser de la usuaria. Solo desconectamos.
