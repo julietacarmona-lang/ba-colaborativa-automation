@@ -346,64 +346,49 @@ def login(page: Page) -> None:
         # Keycloak ya nos mostró un error — no por el badge invisible que
         # siempre está ahí.
         if _real_captcha_challenge(page):
-            # HARD RELOAD retry: Juli observó que "Error en el reCAPTCHA"
-            # muchas veces es el token invisible que expiró por demorar
-            # mucho en submitir, NO un challenge real. La solución que ella
-            # hace a mano es refrescar la página → form fresco → token
-            # invisible nuevo → login pasa sin captcha. Replicamos eso
-            # antes de gastar créditos del solver. Re-tipear sobre el mismo
-            # form (lo que hacíamos antes) heredaba el token vencido.
-            log("⚠️  Error en el reCAPTCHA / no redirect. Hard reload + login fresh…")
-            hard_retry_ok = False
-            try:
-                page.reload(wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)  # dejar que reCAPTCHA Enterprise genere su token natural
-                user_input2 = _first_visible(
-                    page,
-                    [
-                        lambda: page.get_by_label(re.compile(r"CUIL.?CUIT|Usuario", re.I)),
-                        lambda: page.locator("#username"),
-                        lambda: page.locator('input[name="username"]'),
-                    ],
-                    timeout_ms=15000,
-                )
-                user_input2.click()
-                user_input2.type(BA_USER, delay=80)
-                page.wait_for_timeout(800)
-                pw_input2 = _first_visible(
-                    page,
-                    [
-                        lambda: page.get_by_label(re.compile(r"contraseña|password", re.I)),
-                        lambda: page.locator("#password"),
-                        lambda: page.locator('input[name="password"]'),
-                    ],
-                )
-                pw_input2.click()
-                pw_input2.type(BA_PASSWORD, delay=80)
-                page.wait_for_timeout(1500)
-                submit2 = _first_visible(
-                    page,
-                    [
-                        lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
-                        lambda: page.locator('input[type="submit"]'),
-                        lambda: page.locator('button[type="submit"]'),
-                    ],
-                )
-                submit2.click()
-                page.wait_for_url(
-                    re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
-                    timeout=45000,
-                )
-                hard_retry_ok = True
-                log("✓ Hard reload retry funcionó — login OK sin llamar al solver.")
-            except PlaywrightTimeoutError:
-                log("Hard reload retry no alcanzó — challenge persistente. Llamando solver…")
-            except Exception as e:
-                log(f"Hard reload retry tiró excepción ({e}). Llamando solver…")
+            # RESUBMIT-ONLY retry: insight verificado 2026-06-08 con Juli en
+            # vivo desde su Mac. Cuando Keycloak muestra "Error en el
+            # reCAPTCHA" o "Ha tardado demasiado en identificarte", el form
+            # SIGUE con las credenciales tipeadas; el reCAPTCHA invisible
+            # regenera su token al instante. SOLO hay que clickear Ingresar
+            # de nuevo, sin tocar nada más. Confirmado: a la 2da clicada
+            # entra al backoffice limpiamente. Recargar la página o re-
+            # tipear (lo que hacíamos antes) descartaba el form y forzaba
+            # otro round del captcha que vuelve a fallar — eso explica por
+            # qué CI nunca lograba entrar.
+            log("⚠️  Error en el reCAPTCHA / no redirect. Re-click Ingresar (sin tocar el form)…")
+            resubmit_ok = False
+            # Hacemos hasta 3 reintentos: a veces el token tarda 1-2 clicks más
+            for attempt_n in range(1, 4):
+                try:
+                    page.wait_for_timeout(1500)  # dejar que el reCAPTCHA invisible regenere
+                    submit_retry = _first_visible(
+                        page,
+                        [
+                            lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
+                            lambda: page.locator('input[type="submit"]'),
+                            lambda: page.locator('button[type="submit"]'),
+                        ],
+                        timeout_ms=5000,
+                    )
+                    submit_retry.click()
+                    page.wait_for_url(
+                        re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+                        timeout=45000,
+                    )
+                    resubmit_ok = True
+                    log(f"✓ Re-click Ingresar #{attempt_n} funcionó — login OK sin solver.")
+                    break
+                except PlaywrightTimeoutError:
+                    log(f"Re-click #{attempt_n} no alcanzó — pruebo de nuevo.")
+                except Exception as e:
+                    log(f"Re-click #{attempt_n} tiró excepción ({e}).")
+                    break
 
-            if hard_retry_ok:
+            if resubmit_ok:
                 log("Login OK.")
                 return
+            log("3 re-clicks fallaron — caigo al solver como último recurso.")
 
             _solve_captcha(page)
             # Diagnóstico: capturamos qué responde Keycloak después del submit
