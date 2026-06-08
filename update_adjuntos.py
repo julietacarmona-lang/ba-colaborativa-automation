@@ -32,8 +32,8 @@ def log(msg: str) -> None:
 
 def _extract_urls_from_detail(page) -> List[str]:
     """En la pestaña del detalle, clickea cada adjunto y captura las URLs únicas
-    de los popups que se abren. Espera a que el accordion 'Archivos del contacto'
-    esté visible.
+    de los popups que se abren. Expande el accordion 'Archivos del contacto'
+    si está colapsado.
     """
     accordion = page.locator("app-panel-desplegable").filter(
         has=page.get_by_role("button", name=re.compile(r"archivos del contacto", re.I))
@@ -44,14 +44,24 @@ def _extract_urls_from_detail(page) -> List[str]:
         log("  (no apareció la sección 'Archivos del contacto')")
         return []
 
+    # Expandir el accordion si está colapsado (los wrappers no son visibles si está collapsed)
+    try:
+        header_btn = accordion.locator(".accordion-button").first
+        # accordion-button COLLAPSED tiene clase ".collapsed"; si la tiene, clickear
+        if "collapsed" in (header_btn.get_attribute("class") or ""):
+            header_btn.click(force=True)
+            page.wait_for_timeout(800)
+    except Exception:
+        pass
+
     items = accordion.locator(".image-wrapper").all()
     urls: List[str] = []
     for item in items:
         try:
-            with page.expect_popup(timeout=8000) as popup_info:
+            with page.expect_popup(timeout=20000) as popup_info:
                 item.click()
             popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=10000)
+            popup.wait_for_load_state("domcontentloaded", timeout=15000)
             urls.append(popup.url)
             try:
                 popup.close()
@@ -71,63 +81,78 @@ def _extract_urls_from_detail(page) -> List[str]:
 
 
 def _search_by_numero(page, numero: str) -> None:
-    """En la bandeja: limpia criterios, agrega 'Número = {numero}', click Buscar.
-    Después de esto, la grilla queda con (idealmente) solo esa fila."""
-    # Asegurar panel de criterios expandido
+    """En la bandeja: agrega/reusa fila 'Número de contacto contiene {numero}'
+    y click Buscar. Después la grilla queda con esa única fila."""
+    # Asegurar que estoy en la bandeja
+    if "/contacto/bandeja" not in page.url:
+        page.goto(f"{BACKOFFICE_URL}/contacto/bandeja")
+        time.sleep(5)
+
+    # Si Buscar no es visible, expandir el panel
     buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
-    if not buscar.is_visible(timeout=1500):
+    if not buscar.is_visible(timeout=2000):
         try:
             page.get_by_text(re.compile(r"Criterios de b[uú]squeda", re.I)).first.click(force=True)
-            time.sleep(1)
+            time.sleep(2)
         except Exception:
             pass
 
-    # Click en 'Limpiar' para resetear criterios previos
+    # Esperar a que las filas estén renderizadas
     try:
-        page.get_by_role("button", name=re.compile(r"^\s*limpiar\s*$", re.I)).first.click(force=True)
+        page.locator("tr").filter(has=page.locator("ng-select")).first.wait_for(state="attached", timeout=8000)
         time.sleep(1)
     except Exception:
         pass
 
-    # La grilla tiene una fila default vacía con 3 ng-select (campo/operador/valor).
+    # Estrategia simple: si ya existe fila "Número de contacto", solo cambiar
+    # el valor. Si no, agregarla.
     rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
     rows = [r for r in rows if r.locator("ng-select").count() >= 2]
     if not rows:
         raise RuntimeError("no detecté filas de criterios")
 
-    # Configurar la primera fila con Número = numero
-    row1_sels = rows[0].locator("ng-select").all()
-    # 1) campo
-    row1_sels[0].click()
-    page.wait_for_timeout(400)
-    try:
-        active = row1_sels[0].locator(".ng-input input").first
-        active.fill("")
-        active.type("Número", delay=20)
-    except Exception:
-        pass
-    page.wait_for_timeout(600)
-    page.locator(".ng-option").filter(has_text=re.compile(r"^\s*N[uú]mero\s*$", re.I)).first.click()
-    page.wait_for_timeout(700)
-
-    # 2) valor — re-leer (puede tener ahora 2 o 3 ng-select)
-    row1_sels = rows[0].locator("ng-select").all()
-    # El último ng-select es el del valor; debería ser un input editable
-    val_sel = row1_sels[-1]
-    val_sel.click()
-    page.wait_for_timeout(300)
-    try:
-        # Algunos campos numéricos son inputs simples, no ng-select; probemos ambos
-        active = val_sel.locator(".ng-input input").first
-        active.fill("")
-        active.type(numero, delay=20)
-    except Exception:
-        # Fallback: input genérico dentro de la fila
+    # Buscar si ya hay una fila con "Número de contacto"
+    target_row = None
+    for r in rows:
         try:
-            inp = rows[0].locator("input[type='text'], input:not([type])").last
-            inp.fill(numero)
+            labels = r.locator(".ng-value-label").all_inner_texts()
+            if any("número de contacto" in (l or "").lower() for l in labels):
+                target_row = r
+                break
         except Exception:
             pass
+
+    if target_row is None:
+        # Click + en la última fila para agregar nueva
+        try:
+            rows[-1].locator("button.addButton, button[title='Agregar']").first.click(force=True)
+            page.wait_for_timeout(800)
+            rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
+            rows = [r for r in rows if r.locator("ng-select").count() >= 2]
+            target_row = rows[-1]
+        except Exception as e:
+            raise RuntimeError(f"no pude agregar fila: {e}")
+
+        # Configurar el campo en la fila nueva
+        sels = target_row.locator("ng-select").all()
+        sels[0].click()
+        page.wait_for_timeout(400)
+        try:
+            sels[0].locator(".ng-input input").first.fill("")
+            sels[0].locator(".ng-input input").first.type("número", delay=20)
+        except Exception:
+            pass
+        page.wait_for_timeout(600)
+        page.locator(".ng-option").filter(has_text=re.compile(r"n[uú]mero de contacto", re.I)).first.click()
+        page.wait_for_timeout(800)
+
+    # Llenar el valor (input de texto en la última columna de la fila)
+    try:
+        inp = target_row.locator("input[type='text'], input:not([type])").last
+        inp.click()
+        inp.fill(numero)
+    except Exception as e:
+        raise RuntimeError(f"no pude llenar valor: {e}")
     page.wait_for_timeout(500)
 
     # Buscar
@@ -139,27 +164,39 @@ def _search_by_numero(page, numero: str) -> None:
 
 
 def _process_one_ticket(page, numero: str) -> List[str]:
-    """Filtra la bandeja por `numero`, abre el detalle del único resultado,
-    extrae URLs, vuelve a la bandeja."""
+    """Filtra la bandeja por `numero`, abre el detalle en una NUEVA pestaña
+    (para no destruir el estado de la pestaña principal con go_back), extrae
+    URLs, cierra la pestaña del detalle."""
     _search_by_numero(page, numero)
 
-    # Verificar que aparece la celda con el número (la única fila)
+    # Verificar que aparece la fila con el número
     cell = page.locator("datatable-body-cell").filter(has_text=numero).first
     cell.wait_for(state="visible", timeout=10000)
     cell.click()
-    # Click en 'Ver detalles' → navega al detalle
-    page.get_by_role("link", name=re.compile(r"^\s*ver detalles\s*$", re.I)).first.click(force=True)
-    page.wait_for_url(re.compile(r"/contacto/consulta/"), timeout=15000)
-    time.sleep(4)
 
-    urls = _extract_urls_from_detail(page)
+    # Capturar el href del link "Ver detalles" en lugar de clickear (así abro
+    # en pestaña nueva manualmente y no toco la principal).
+    link = page.get_by_role("link", name=re.compile(r"^\s*ver detalles\s*$", re.I)).first
+    link.wait_for(state="visible", timeout=5000)
+    href = link.get_attribute("href")
+    if not href:
+        raise RuntimeError("link 'Ver detalles' no tiene href")
+    if href.startswith("/"):
+        href = BACKOFFICE_URL + href
 
-    # Volver a la bandeja
+    # Abrir detalle en NUEVA pestaña del mismo contexto (comparte cookies)
+    ctx = page.context
+    detail_page = ctx.new_page()
     try:
-        page.go_back(wait_until="domcontentloaded", timeout=15000)
-    except Exception:
-        page.goto(f"{BACKOFFICE_URL}/contacto/bandeja")
-    time.sleep(3)
+        detail_page.goto(href, wait_until="domcontentloaded", timeout=20000)
+        time.sleep(4)  # Angular hidrata
+        urls = _extract_urls_from_detail(detail_page)
+    finally:
+        try:
+            detail_page.close()
+        except Exception:
+            pass
+
     return urls
 
 
