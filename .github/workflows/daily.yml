@@ -168,37 +168,65 @@ jobs:
           path: downloads/
           if-no-files-found: ignore
 
-      - name: Avisar a Slack si el job falló o fue cancelado por timeout
-        # Anti-spam: solo notificar si el run ANTERIOR del workflow fue
-        # success. Así, cuando el chain se rompe, avisa la PRIMERA vez y
-        # después calla hasta que vuelva a andar. Si el job se cancela
-        # (timeout 45min), GitHub mata Python antes de que mande la noti
-        # desde adentro; por eso este step corre fuera del proceso Python.
+      - name: Avisar a Slack solo si es la 2da falla consecutiva
+        # Regla 2026-06-08: 1 falla puede ser GCBA inestable; 2 fallas
+        # seguidas = chain roto, hora de avisar. Anti-spam: después del
+        # aviso por el "2do fallo", silencio hasta que vuelva a andar.
+        # Si el job se canceló (timeout 45min), GitHub mata Python antes
+        # de que mande la noti desde adentro; este step corre afuera.
         if: ${{ (failure() || cancelled()) && env.SLACK_WEBHOOK_URL_ERROR != '' }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
           STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
           EVENT: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
-          # Chequeo si el run inmediato anterior fue success (=primer fallo del chain).
-          # Si el anterior NO fue success, asumimos que ya se avisó y callamos.
-          PREV_STATUS=$(gh run list --workflow="${{ github.workflow }}" --branch=main --limit=2 --json conclusion --jq '.[1].conclusion // "unknown"' 2>/dev/null || echo "unknown")
-          echo "Conclusión del run anterior: $PREV_STATUS"
-          if [ "$PREV_STATUS" != "success" ] && [ "$PREV_STATUS" != "unknown" ]; then
-            echo "El run anterior también falló ($PREV_STATUS). No notifico para evitar spam."
+          # Miro las 2 últimas conclusiones ANTES del run actual.
+          # PREV = la inmediatamente anterior; PREV_PREV = la dos antes.
+          # Regla: notifico solo si PREV != success (este es el 2do fail)
+          # Y PREV_PREV == success (el anterior fue el primer fail).
+          # Eso evita: (a) ruido por 1 fail aislado y (b) spam si ya avisé.
+          CONCLS=$(gh run list --workflow="${{ github.workflow }}" --branch=main --limit=3 --json conclusion --jq '[.[].conclusion // "none"] | join(" ")' 2>/dev/null || echo "none none none")
+          # CONCLS[0] = ACTUAL (este run), CONCLS[1] = previo, CONCLS[2] = pre-previo
+          PREV=$(echo "$CONCLS" | awk '{print $2}')
+          PREV_PREV=$(echo "$CONCLS" | awk '{print $3}')
+          echo "Conclusiones recientes (actual, prev, prev_prev): $CONCLS"
+          if [ "$PREV" = "success" ] || [ "$PREV" = "none" ]; then
+            echo "Run anterior fue OK (o sin historia). Es solo 1 fall — puede ser GCBA caído un toque. No notifico todavía."
             exit 0
           fi
+          if [ "$PREV_PREV" != "success" ] && [ "$PREV_PREV" != "none" ]; then
+            echo "El pre-anterior tampoco fue success — ya hubo aviso. Anti-spam: no notifico."
+            exit 0
+          fi
+          # Este es el 2do fail consecutivo, el primer aviso. Diagnostico el tipo.
+          LOG=$(gh run view "$RUN_ID" --log 2>&1 | head -2000 || echo "")
+          DIAG="❓ No pude inferir el tipo de fallo. Revisá el run."
+          ACCION="Mirá el log del run para más pistas."
+          if echo "$LOG" | grep -q "Usuario o contraseña incorrectos"; then
+            DIAG="🔐 Keycloak rechazó las credenciales — probablemente cambió la password de Cecilia."
+            ACCION="Actualizá el secret con: \`gh secret set BA_PASSWORD --repo ${{ github.repository }}\`"
+          elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal Server|backend.+ 5[0-9][0-9]"; then
+            DIAG="🌩️ Backend del GCBA caído (5xx). No es nuestro problema."
+            ACCION="Esperá 1-2h. La próxima corrida del cron probablemente pase."
+          elif echo "$LOG" | grep -qE "captchas? rechazado|Error en el reCAPTCHA|CapSolver"; then
+            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score desde IP de GitHub."
+            ACCION="Refrescá la sesión: \`cd ~/Automatizacion-bajada-tickets-sinigep && ./scripts/refresh-session.sh\`"
+          elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.+selector|ng-select|addButton|modal.+Exportar"; then
+            DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
+            ACCION="Avisame para que investigue."
+          fi
           if [ "$STATUS" = "cancelled" ]; then
-            REASON="⏱️ El job se canceló (probablemente timeout 45min — el scraper se quedó colgado)."
+            HEADER="⏱️ *BA Colaborativa: 2 corridas seguidas fallaron (la última por timeout 45min)*"
           else
-            REASON="❌ El job falló antes de completar el pipeline."
+            HEADER="🚨 *BA Colaborativa: 2 corridas seguidas fallaron*"
           fi
           TRIGGER="cron \`$SCHEDULE\`"
           [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
-          TEXT=":rotating_light: *BA Colaborativa cron cayó* ($TRIGGER)\n$REASON\nPróximos crons también van a fallar hasta que se destrabe — no te van a llegar más notis hasta que vuelva a andar.\n<$RUN_URL|Ver run en GitHub Actions>"
+          TEXT="$HEADER ($TRIGGER)\n*Diagnóstico:* $DIAG\n*Qué hacer:* $ACCION\n<$RUN_URL|Ver run en GitHub Actions>\n_(No te voy a avisar de cada corrida fallida — calla hasta que vuelva a andar.)_"
           curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" \
             "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"
