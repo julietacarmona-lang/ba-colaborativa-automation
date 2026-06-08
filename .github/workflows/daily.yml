@@ -207,10 +207,10 @@ jobs:
           if [ "$STATUS" = "cancelled" ]; then
             DIAG="⏱️ El job se canceló (timeout 45min — el scraper se quedó colgado en algún paso)."
             ACCION="Mirá el log para ver dónde se trabó. Si pasó muchas veces seguidas, refrescá la sesión: \`./scripts/refresh-session.sh\`"
-          elif [ "${DUR}" -lt 600 ] 2>/dev/null && [ "${DUR}" != "0" ]; then
-            # < 10min con failure → casi seguro early abort por captcha rechazado
-            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score desde IP de GitHub. (Abortado rápido por early abort.)"
-            ACCION="Esto es intermitente; suele resolverse solo en alguna corrida cercana. Si persiste 4+ runs, refrescá: \`./scripts/refresh-session.sh\`"
+          elif [ "${DUR}" -lt 1800 ] 2>/dev/null && [ "${DUR}" != "0" ]; then
+            # < 30min con failure → early abort por captcha rechazado (5 intentos espaciados)
+            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasó en los 5 intentos del run."
+            ACCION="Esto es intermitente; suele resolverse solo en alguna corrida cercana. Si persiste 2+ runs seguidos, el workflow se pausa solo y vas a recibir alerta roja."
           else
             # Fallback: analizar log
             LOG=$(gh run view "$RUN_ID" --log 2>&1 || echo "")

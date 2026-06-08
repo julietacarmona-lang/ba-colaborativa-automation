@@ -1345,6 +1345,13 @@ def download_tickets() -> Path:
 
     last_exc: Optional[BaseException] = None
     captcha_rejections = 0
+    # Permitimos hasta 5 captchas rechazados consecutivos dentro de un mismo
+    # run; entre cada intento esperamos 60s a ver si Keycloak/Google aflojan.
+    # Razón: a veces "después de unos minutos" sí pasa, aunque las primeras
+    # veces rechace. Si 5 seguidos no pasan, dejamos que el próximo cron (1h)
+    # lo intente. La lógica del workflow corta el cron si 2 runs seguidos fallan.
+    MAX_CAPTCHA_REJECTIONS = 5
+    CAPTCHA_RETRY_WAIT = 60
     for attempt in range(1, MAX_ATTEMPTS + 1):
         log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
         try:
@@ -1352,17 +1359,17 @@ def download_tickets() -> Path:
         except CaptchaRejectedError as e:
             last_exc = e
             captcha_rejections += 1
-            log(f"Intento {attempt}: captcha rechazado por Keycloak ({captcha_rejections}/2).")
-            if captcha_rejections >= 2:
+            log(f"Intento {attempt}: captcha rechazado por Keycloak ({captcha_rejections}/{MAX_CAPTCHA_REJECTIONS}).")
+            if captcha_rejections >= MAX_CAPTCHA_REJECTIONS:
                 log(
-                    "⛔ 2 captchas rechazados seguidos — abortando run. "
-                    "El solver no está pasando el score del GCBA. "
-                    "Refrescar BA_SESSION_JSON manualmente con scripts/refresh-session.sh "
-                    "para saltear el login."
+                    f"⛔ {MAX_CAPTCHA_REJECTIONS} captchas rechazados seguidos — abortando run. "
+                    "El solver no está pasando el score del GCBA en esta ventana. "
+                    "Próximo cron (1h) intentará de nuevo. Si 2 crones seguidos fallan, "
+                    "el workflow se pausa automáticamente."
                 )
                 break
-            log("Reintentando inmediatamente…")
-            time.sleep(1)
+            log(f"Esperando {CAPTCHA_RETRY_WAIT}s antes de reintentar (Google a veces afloja)…")
+            time.sleep(CAPTCHA_RETRY_WAIT)
         except Exception as e:
             last_exc = e
             log(f"Intento {attempt} falló: {e!r}")
