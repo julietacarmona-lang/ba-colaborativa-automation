@@ -247,7 +247,7 @@ jobs:
               EXTRA="_(Intenté pausar el cron pero el comando falló. Pausalo manualmente desde Actions → Workflows → ... → Disable workflow.)_"
             fi
           fi
-          TEXT="$HEADER\n*Diagnóstico:* $DIAG\n*Qué hacer:* $ACCION\n<$RUN_URL|Ver run en GitHub Actions>\n$EXTRA"
+          TEXT="$HEADER"$'\n'"*Diagnóstico:* $DIAG"$'\n'"*Qué hacer:* $ACCION"$'\n'"<$RUN_URL|Ver run en GitHub Actions>"$'\n'"$EXTRA"
           curl -sS -X POST -H 'Content-Type: application/json' \
-            --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" \
+            --data "$(jq -nc --arg t "$TEXT" '{text: $t, username: "BA Colaborativa Bot", icon_emoji: ":rotating_light:"}')" \
             "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"

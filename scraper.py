@@ -288,8 +288,10 @@ def login(page: Page) -> None:
     page.wait_for_timeout(2500)
 
     # Tipeo "humano" con delay entre teclas — fill() instantáneo da score bajo.
+    # Ctrl+A antes de type() limpia el campo si tenía texto de un intento anterior.
     log("Tipeando CUIL…")
     user_input.click()
+    user_input.fill("")  # limpia autofill del perfil de Chrome antes de tipear
     user_input.type(BA_USER, delay=80)
 
     page.wait_for_timeout(800)
@@ -304,6 +306,7 @@ def login(page: Page) -> None:
     )
     log("Tipeando contraseña…")
     pw_input.click()
+    pw_input.fill("")  # limpia autofill
     pw_input.type(BA_PASSWORD, delay=80)
 
     # Pausa antes de clickear — humano lee/duda antes de submit.

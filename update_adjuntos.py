@@ -22,18 +22,32 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from update_sheets import _load_credentials, SHEET_TAB
 
 CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
+BROWSER_MODE = os.environ.get("BROWSER_MODE", "cdp").strip().lower()
+USER_DATA_DIR = Path(os.environ.get("USER_DATA_DIR", "./.playwright-user-data")).resolve()
+HEADLESS = os.environ.get("HEADLESS", "false").strip().lower() in ("1", "true", "yes")
 BACKOFFICE_URL = "https://bacolaborativa-backoffice.buenosaires.gob.ar"
 MAX_TICKETS_PER_RUN = int(os.environ.get("ADJUNTOS_MAX_TICKETS", "20"))
+
+# Solo matchea el wrapper exterior, no los mat-icon anidados que también tienen image-container
+ITEM_SEL = "div.image-wrapper, div.image-container"
+
+
+class _NoUrlsError(RuntimeError):
+    """El ticket tiene adjuntos según el CSV pero no se pudo extraer ninguna URL."""
 
 
 def log(msg: str) -> None:
     print(f"[adjuntos] {msg}", flush=True)
 
 
-def _extract_urls_from_detail(page) -> List[str]:
-    """En la pestaña del detalle, clickea cada adjunto y captura las URLs únicas
-    de los popups que se abren. Expande el accordion 'Archivos del contacto'
-    si está colapsado.
+def _extract_urls_from_detail(page, detail_href: str) -> List[str]:
+    """En la pestaña del detalle extrae las URLs de todos los adjuntos.
+
+    Estrategia por tipo:
+      - Imagen: <img src> en el wrapper (sin click).
+      - PDF/otro vía JS: extrae href/data-url del elemento o __ngContext__ de Angular.
+      - PDF/otro vía popup: el click abre nueva pestaña.
+      - PDF/otro vía navegación: el click navega la página actual → capturamos URL y volvemos.
     """
     accordion = page.locator("app-panel-desplegable").filter(
         has=page.get_by_role("button", name=re.compile(r"archivos del contacto", re.I))
@@ -43,45 +57,297 @@ def _extract_urls_from_detail(page) -> List[str]:
     except PlaywrightTimeoutError:
         log("  (no apareció la sección 'Archivos del contacto')")
         return []
+    except Exception as e:
+        log(f"  (error esperando accordion: {e!r})")
+        return []
 
-    # Expandir el accordion si está colapsado (los wrappers no son visibles si está collapsed)
+    # Capturar respuestas de API cuando se expande el accordion
+    api_responses: list = []
+
+    def _on_accordion_response(resp):
+        try:
+            url = resp.url
+            if resp.status == 200 and "GCS-backend" in url:
+                body = resp.text()
+                api_responses.append({"url": url, "body": body[:2000]})
+        except Exception:
+            pass
+
+    page.on("response", _on_accordion_response)
     try:
         header_btn = accordion.locator(".accordion-button").first
-        # accordion-button COLLAPSED tiene clase ".collapsed"; si la tiene, clickear
         if "collapsed" in (header_btn.get_attribute("class") or ""):
             header_btn.click(force=True)
-            page.wait_for_timeout(800)
+            try:
+                accordion.locator(".accordion-collapse.show").first.wait_for(state="visible", timeout=3000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+        # Si el accordion YA estaba abierto (sin "collapsed"), cerrarlo y reabrirlo
+        # para forzar una nueva llamada a la API (puede haber estado abierto por visita previa)
+        else:
+            header_btn.click(force=True)  # cerrar
+            page.wait_for_timeout(500)
+            header_btn.click(force=True)  # reabrir → dispara API
+            try:
+                accordion.locator(".accordion-collapse.show").first.wait_for(state="visible", timeout=3000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
     except Exception:
         pass
+    page.wait_for_timeout(1500)  # esperar respuestas pendientes
+    page.remove_listener("response", _on_accordion_response)
 
-    items = accordion.locator(".image-wrapper").all()
+    # Extraer URLs de las respuestas de API capturadas
+    import json as _json
+    from_api: List[str] = []
+    for r in api_responses:
+        body_text = r["body"]
+        # Primero intentar parsear JSON
+        extracted = False
+        try:
+            data = _json.loads(body_text)
+            items = data if isinstance(data, list) else (data.get("items") or data.get("archivos") or [])
+            for item in items:
+                if isinstance(item, dict) and item.get("url"):
+                    from_api.append(item["url"])
+                    extracted = True
+        except Exception:
+            pass
+        # Fallback: regex sobre el body si el JSON falla
+        if not extracted:
+            url_matches = re.findall(
+                r'https?://[^\s"\'<>\\]+(?:adjunto|archivo|file|cdn|download)[^\s"\'<>\\]*',
+                body_text,
+                re.I,
+            )
+            from_api.extend(url_matches)
+    if from_api:
+        unique_api = list(dict.fromkeys(from_api))
+        log(f"  → {len(unique_api)} URL(s) de adjuntos vía API")
+        return unique_api
+
+    # Polling: esperar hasta 5s para que Angular cargue los items
+    item_count = 0
+    for _ in range(5):
+        item_count = accordion.locator(ITEM_SEL).count()
+        if item_count > 0:
+            break
+        page.wait_for_timeout(1000)
+
+    if item_count == 0:
+        try:
+            html_sample = accordion.first.inner_html(timeout=2000)
+            log(f"  ⚠️  sección encontrada pero 0 items ({ITEM_SEL!r}). HTML: {html_sample[:300]!r}")
+        except Exception:
+            log(f"  ⚠️  sección encontrada pero 0 items ({ITEM_SEL!r})")
+    else:
+        log(f"  {item_count} item(s) encontrados.")
     urls: List[str] = []
-    for item in items:
-        # Caso imagen: el wrapper ya tiene <img src=cdn.../> visible.
-        # Lo capturamos sin hacer click (más rápido y robusto).
+
+    for idx in range(item_count):
+        log(f"  → item {idx}: evaluando tiers…")
+        # Re-fetching por índice: el DOM puede haberse refrescado si hubo navegación y back.
+        try:
+            acc = page.locator("app-panel-desplegable").filter(
+                has=page.get_by_role("button", name=re.compile(r"archivos del contacto", re.I))
+            )
+            item = acc.locator(ITEM_SEL).nth(idx)
+            item.wait_for(state="attached", timeout=3000)
+        except Exception as e:
+            log(f"  ⚠️  item {idx} no disponible: {e}")
+            continue
+
+        # DEBUG: ver HTML y Angular context del item
+        try:
+            item_html = item.inner_html(timeout=2000)
+            log(f"  [debug] item {idx} HTML: {item_html[:300]}")
+        except Exception as e:
+            log(f"  [debug] item {idx} HTML error: {e}")
+        try:
+            ng_data = item.evaluate("""el => {
+                if (!window.ng || !window.ng.getComponent) return 'no_ng';
+                // Buscar en el item y todos sus ancestros
+                let node = el;
+                while (node && node.tagName !== 'BODY') {
+                    try {
+                        const comp = window.ng.getComponent(node);
+                        if (comp) {
+                            const s = JSON.stringify(comp, (k,v) => typeof v === 'function' ? undefined : v);
+                            // Buscar cualquier URL http
+                            const m = s.match(/"(?:url|src|href|file|ruta|path|nombre|adjunto|name|link|urlArchivo|urlAdjunto)[^"]*":\\s*"(https?:\\/\\/[^"]+)"/i);
+                            if (m) return 'found:' + m[1];
+                            return 'comp_at_' + node.tagName + ':' + s.slice(0, 400);
+                        }
+                    } catch(e) {}
+                    node = node.parentElement;
+                }
+                return 'no_comp_any';
+            }""")
+            log(f"  [debug] ngData: {ng_data[:200]}")
+        except Exception as e:
+            log(f"  [debug] ngData error: {e}")
+
+        # 1. Imagen: <img src> directo, sin click.
         try:
             img_src = item.locator("img").first.get_attribute("src", timeout=1500)
-            if img_src and "cdn.buenosaires" in img_src:
+            if img_src:
+                log(f"  [debug] img src: {img_src[:120]}")
+            if img_src and img_src.startswith("http") and BACKOFFICE_URL not in img_src:
                 urls.append(img_src)
                 continue
         except Exception:
             pass
 
-        # Caso PDF u otro: hay un mat-icon, hay que clickear para abrir popup.
+        # 2. Sin click: intentar extraer URL de atributos del DOM o de __ngContext__ de Angular.
         try:
-            with page.expect_popup(timeout=20000) as popup_info:
-                item.click()
-            popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=15000)
-            urls.append(popup.url)
-            try:
-                popup.close()
-            except Exception:
-                pass
-        except Exception as e:
-            log(f"  ⚠️  un adjunto falló: {e!r}")
+            pdf_url = item.evaluate("""el => {
+                const a = el.querySelector('a[href]');
+                if (a && a.href && !a.href.startsWith('javascript')) return a.href;
+                for (const attr of ['data-url', 'data-src', 'data-href', 'data-file']) {
+                    const v = el.getAttribute(attr);
+                    if (v && v.startsWith('http')) return v;
+                }
+                const ctx = el.__ngContext__;
+                if (ctx) {
+                    const s = JSON.stringify(ctx);
+                    const m = s.match(/"(?:url|src|href|file|link)"\\s*:\\s*"(https?:\\/\\/[^"]+)"/);
+                    if (m) return m[1];
+                }
+                return null;
+            }""")
+            if pdf_url and pdf_url.startswith("http"):
+                urls.append(pdf_url)
+                continue
+        except Exception:
+            pass
 
-    # Dedup conservando orden — el DOM puede tener wrapper/container apuntando al mismo archivo
+        # 3. Interceptar la request de red antes del click para capturar la URL
+        #    del adjunto SIN descargarlo. Capturamos CDN y llamadas al backend
+        #    de archivos (GCS-backend/adjunto, GCS-backend/file, etc.).
+        intercepted: list = []
+        all_reqs: list = []
+
+        def _intercept(route):
+            url = route.request.url
+            all_reqs.append(url)
+            is_adjunto = (
+                "cdn.buenosaires" in url
+                or "adjuntosSUACI" in url
+                or "/adjunto" in url.lower()
+                or "/archivo" in url.lower()
+                or "/file" in url.lower()
+                or "/download" in url.lower()
+            )
+            if is_adjunto:
+                intercepted.append(url)
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+            else:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        page.route("**/*", _intercept)
+        try:
+            item.click()
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        page.unroute("**/*", _intercept)
+
+        # Debug: mostrar todos los requests disparados por el click
+        if not intercepted and all_reqs:
+            log(f"  [debug] {len(all_reqs)} req(s) al clickear, ninguno capturado como adjunto:")
+            for u in all_reqs[-5:]:
+                log(f"    {u[:120]}")
+        if intercepted:
+            for u in intercepted:
+                log(f"  → interceptado: {u[:80]}")
+            urls.extend(intercepted)
+            continue
+
+        # 4. Popup: el click abrió pestaña nueva.
+        # IMPORTANTE: excluir la página principal (bandeja) que ya existe en el contexto.
+        for pp in list(page.context.pages):
+            pp_url = pp.url or ""
+            if (pp is not page
+                    and pp_url not in ("about:blank", "", detail_href)
+                    and "/contacto/bandeja" not in pp_url
+                    and "identidad-gcaba" not in pp_url):
+                try:
+                    pp.wait_for_load_state("domcontentloaded", timeout=5000)
+                    log(f"  → popup capturado: {pp.url[:80]}")
+                    urls.append(pp.url)
+                    pp.close()
+                except Exception:
+                    pass
+                break
+
+        # 5. Navegación de la página actual (PDF que navega en lugar de descargar).
+        #    Solo captura si navegó a un dominio DISTINTO al backoffice
+        #    (evita falsos positivos por Angular cambiando query params).
+        else:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+                nav_url = page.url
+                detail_base = detail_href.split("?")[0]
+                nav_base = (nav_url or "").split("?")[0]
+                is_real_file_nav = (
+                    nav_url
+                    and nav_base != detail_base
+                    and BACKOFFICE_URL not in nav_url
+                    and "identidad-gcaba" not in nav_url
+                )
+                if is_real_file_nav:
+                    log(f"  → navegación capturada: {nav_url[:80]}")
+                    urls.append(nav_url)
+                    # Volver al detalle con go_back
+                    page.go_back()
+                    page.wait_for_timeout(3000)
+                else:
+                    page.wait_for_timeout(1000)
+                # Re-expandir accordion en ambos casos
+                try:
+                    acc2 = page.locator("app-panel-desplegable").filter(
+                        has=page.get_by_role("button", name=re.compile(r"archivos del contacto", re.I))
+                    )
+                    btn2 = acc2.locator(".accordion-button").first
+                    if "collapsed" in (btn2.get_attribute("class") or ""):
+                        btn2.click(force=True)
+                        page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+            except Exception as e:
+                log(f"  ⚠️  adjunto idx={idx} falló en tier5: {e!r}")
+
+    # DEBUG: buscar URLs en todos los componentes del detalle
+    if not urls:
+        try:
+            all_comp_data = page.evaluate("""() => {
+                if (!window.ng || !window.ng.getComponent) return 'no_ng';
+                const results = [];
+                // Probar en todos los custom elements de la página
+                const els = document.querySelectorAll('app-panel-desplegable, app-adjunto, app-archivos, [class*="adjunto"], [class*="archivo"]');
+                for (const el of els) {
+                    try {
+                        const comp = window.ng.getComponent(el);
+                        if (comp) {
+                            const s = JSON.stringify(comp, (k,v) => typeof v === 'function' ? undefined : v);
+                            results.push(el.tagName + '/' + el.className.slice(0,30) + ':' + s.slice(0, 300));
+                        }
+                    } catch(e) {}
+                }
+                return results.length ? results.join('\\n---\\n') : 'ningún componente Angular encontrado';
+            }""")
+            log(f"  [debug] componentes detalle: {all_comp_data[:600]}")
+        except Exception as e:
+            log(f"  [debug] componentes error: {e}")
+
     seen = set()
     unique: List[str] = []
     for u in urls:
@@ -91,122 +357,340 @@ def _extract_urls_from_detail(page) -> List[str]:
     return unique
 
 
-def _search_by_numero(page, numero: str) -> None:
-    """En la bandeja: agrega/reusa fila 'Número de contacto contiene {numero}'
-    y click Buscar. Después la grilla queda con esa única fila."""
-    # Asegurar que estoy en la bandeja
-    if "/contacto/bandeja" not in page.url:
-        page.goto(f"{BACKOFFICE_URL}/contacto/bandeja")
-        time.sleep(5)
+BA_USER = os.environ.get("BA_USER", "").strip()
+BA_PASSWORD = os.environ.get("BA_PASSWORD", "")
 
-    # Si Buscar no es visible, expandir el panel
-    buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
-    if not buscar.is_visible(timeout=2000):
+
+def _wait_for_visible_any(page, factories, timeout_ms: int = 15000):
+    """Devuelve el primer locator visible de la lista (replica scraper._first_visible)."""
+    import time as _t
+    deadline = _t.time() + timeout_ms / 1000
+    last_err = None
+    while _t.time() < deadline:
+        for factory in factories:
+            try:
+                loc = factory().first
+                loc.wait_for(state="visible", timeout=500)
+                return loc
+            except Exception as e:
+                last_err = e
+        page.wait_for_timeout(250)
+    raise RuntimeError(f"Ningún selector visible en {timeout_ms}ms. Último: {last_err}")
+
+
+def _detect_auth_state(page, timeout_s: float = 30.0) -> str:
+    """Espera hasta que aparezca login form O nav del backoffice. Devuelve 'login'|'backoffice'|'unknown'."""
+    pw = page.locator('input[type="password"]')
+    login_text = page.get_by_text(re.compile(r"Iniciar sesi[oó]n|Usuario \(CUIL", re.I))
+    nav = page.get_by_text(re.compile(r"^\s*(Contactos|Ciudadanos)\s*$", re.I))
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
         try:
-            page.get_by_text(re.compile(r"Criterios de b[uú]squeda", re.I)).first.click(force=True)
+            if pw.first.is_visible(timeout=200):
+                return "login"
+        except Exception:
+            pass
+        try:
+            if login_text.first.is_visible(timeout=200):
+                return "login"
+        except Exception:
+            pass
+        try:
+            if nav.first.is_visible(timeout=200):
+                return "backoffice"
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+    return "unknown"
+
+
+def _authenticate_and_goto_bandeja(page) -> None:
+    """Navega a root, login si expiró la sesión, va a bandeja via menú (Angular router).
+    Uso de menú en vez de goto() para evitar que OAuth redirija siempre a /."""
+    log("  Autenticando y navegando a bandeja…")
+
+    # Ir a root: el SPA bootstrap + OAuth arranca desde aquí
+    try:
+        page.goto(BACKOFFICE_URL + "/", wait_until="commit", timeout=20000)
+    except Exception as e:
+        if "interrupted" not in str(e).lower():
+            raise
+
+    # Esperar Angular
+    try:
+        page.wait_for_function(
+            "() => { const r = document.querySelector('app-root'); return r && r.children.length > 0; }",
+            timeout=30000,
+        )
+    except Exception:
+        pass
+    time.sleep(2)
+
+    # Detectar si se necesita login o ya está autenticado
+    state = _detect_auth_state(page, timeout_s=30.0)
+
+    if state == "login":
+        if not BA_USER or not BA_PASSWORD:
+            raise RuntimeError("sesión expirada pero BA_USER/BA_PASSWORD no están configurados")
+        log("  (sesión expirada — logueando)")
+        try:
+            u = _wait_for_visible_any(page, [
+                lambda: page.locator("#username"),
+                lambda: page.locator("input[name='username']"),
+                lambda: page.locator("input[autocomplete='username']"),
+            ], timeout_ms=10000)
+            u.fill("")
+            u.type(BA_USER, delay=60)
+            page.wait_for_timeout(600)
+            pw = _wait_for_visible_any(page, [
+                lambda: page.locator("#password"),
+                lambda: page.locator("input[name='password']"),
+                lambda: page.locator("input[type='password']"),
+            ], timeout_ms=5000)
+            pw.fill("")
+            pw.type(BA_PASSWORD, delay=60)
+            page.wait_for_timeout(1200)
+            _wait_for_visible_any(page, [
+                lambda: page.locator("button[type='submit']"),
+                lambda: page.get_by_role("button", name=re.compile(r"ingresar|iniciar|acceder|continuar|entrar", re.I)),
+                lambda: page.locator("input[type='submit']"),
+            ], timeout_ms=5000).click()
+        except Exception as e:
+            raise RuntimeError(f"login falló: {e}")
+        # Esperar que Keycloak redirija al backoffice (igual que scraper: 45s)
+        try:
+            page.wait_for_url(
+                re.compile(r"bacolaborativa-backoffice\.buenosaires\.gob\.ar"),
+                timeout=45000,
+            )
+        except Exception:
+            pass
+        # Esperar que Angular procese el OAuth callback y renderice el nav
+        try:
+            page.wait_for_function(
+                "() => { const r = document.querySelector('app-root'); return r && r.children.length > 0; }",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+        time.sleep(3)
+        # Verificar estado (busca Contactos en el nav)
+        state = _detect_auth_state(page, timeout_s=30.0)
+        if state != "backoffice":
+            raise RuntimeError(f"login no llevó al backoffice (state={state!r}, url={page.url[:80]!r})")
+
+    elif state == "unknown":
+        raise RuntimeError(f"estado desconocido después de cargar root (url={page.url[:80]!r})")
+
+    # Navegar a bandeja via click en menú (Angular router, no goto → no OAuth)
+    contactos = _wait_for_visible_any(page, [
+        lambda: page.get_by_role("button", name=re.compile(r"^\s*contactos\s*$", re.I)),
+        lambda: page.get_by_role("link", name=re.compile(r"^\s*contactos\s*$", re.I)),
+        lambda: page.locator("nav, header").get_by_text(re.compile(r"^\s*contactos\s*$", re.I)),
+        lambda: page.get_by_text(re.compile(r"^\s*contactos\s*$", re.I)),
+    ], timeout_ms=15000)
+    contactos.click(force=True)
+    time.sleep(1)
+
+    bandeja_item = _wait_for_visible_any(page, [
+        lambda: page.get_by_role("menuitem", name=re.compile(r"bandeja", re.I)),
+        lambda: page.get_by_role("link", name=re.compile(r"bandeja", re.I)),
+        lambda: page.locator("a, li, button").filter(has_text=re.compile(r"bandeja", re.I)),
+    ], timeout_ms=5000)
+    bandeja_item.click(force=True)
+
+    # Esperar que la bandeja cargue (botón Buscar visible)
+    try:
+        page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first.wait_for(
+            state="visible", timeout=25000
+        )
+    except Exception:
+        # Panel colapsado — expandir
+        try:
+            page.get_by_role("button", name=re.compile(r"criterios de b[uú]squeda", re.I)).first.click(force=True)
             time.sleep(2)
         except Exception:
             pass
 
-    # Esperar a que las filas estén renderizadas
-    try:
-        page.locator("tr").filter(has=page.locator("ng-select")).first.wait_for(state="attached", timeout=8000)
-        time.sleep(1)
-    except Exception:
-        pass
+    if "/contacto/bandeja" not in page.url:
+        raise RuntimeError(f"no llegué a bandeja (url={page.url!r})")
+    log("  ✓ Bandeja lista.")
 
-    # Estrategia simple: si ya existe fila "Número de contacto", solo cambiar
-    # el valor. Si no, agregarla.
-    rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
-    rows = [r for r in rows if r.locator("ng-select").count() >= 2]
+
+def _ng_select_open_and_pick(page, ng_sel_locator, option_text_re, search_text: str = "") -> None:
+    """Abre un ng-select usando coordenadas del mouse (bypassa visibility checks)
+    y selecciona la opción que matchea option_text_re."""
+    # Scroll + click via coordenadas reales (bypassa Playwright visibility checks)
+    coords = ng_sel_locator.evaluate("""el => {
+        el.scrollIntoView({block: 'center', behavior: 'instant'});
+        const r = el.getBoundingClientRect();
+        return {x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width};
+    }""")
+    if coords and coords.get("w", 0) > 0:
+        page.mouse.click(coords["x"], coords["y"])
+    else:
+        ng_sel_locator.evaluate("el => el.click()")
+    page.wait_for_timeout(600)
+
+    # Tipear texto para filtrar opciones
+    if search_text:
+        try:
+            inp = ng_sel_locator.locator(".ng-input input").first
+            inp.type(search_text, delay=30)
+        except Exception:
+            page.keyboard.type(search_text, delay=30)
+        page.wait_for_timeout(600)
+
+    # Seleccionar opción
+    page.locator(".ng-option").filter(has_text=option_text_re).first.click(timeout=10000)
+    page.wait_for_timeout(600)
+
+
+def _search_on_bandeja(page, numero: str) -> None:
+    """Asume que page está en /contacto/bandeja. Configura el criterio
+    'Número de contacto = {numero}' como ÚNICO criterio y hace click en Buscar.
+    Elimina criterios previos (ej. Estado=Abierto) para no excluir tickets cerrados."""
+    buscar_loc = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
+
+    # Expandir panel si hace falta
+    if not buscar_loc.is_visible(timeout=1000):
+        try:
+            page.get_by_role("button", name=re.compile(r"criterios de b[uú]squeda", re.I)).first.click(force=True)
+            time.sleep(2)
+        except Exception:
+            pass
+
+    # Esperar filas de criterios
+    rows = []
+    for _ in range(5):
+        rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
+        rows = [r for r in rows if r.locator("ng-select").count() >= 2]
+        if rows:
+            break
+        time.sleep(2)
     if not rows:
         raise RuntimeError("no detecté filas de criterios")
 
-    # Buscar si ya hay una fila con "Número de contacto"
+    # Buscar fila "Número de contacto" existente
     target_row = None
+    non_numero_rows = []
     for r in rows:
         try:
             labels = r.locator(".ng-value-label").all_inner_texts()
-            if any("número de contacto" in (l or "").lower() for l in labels):
+            if any("número de contacto" in (lbl or "").lower() for lbl in labels):
                 target_row = r
-                break
+            else:
+                non_numero_rows.append(r)
         except Exception:
-            pass
+            non_numero_rows.append(r)
+
+    # FIX Error 2: eliminar criterios que no son Número (ej. Estado=Abierto)
+    # para que la búsqueda no excluya tickets cerrados o reasignados.
+    if target_row is not None:
+        for r in non_numero_rows:
+            try:
+                del_btn = r.locator(
+                    "button.removeButton, button[title='Eliminar'], "
+                    "button[aria-label='Eliminar'], button[aria-label='Remove']"
+                ).first
+                del_btn.evaluate("el => el.click()")
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
 
     if target_row is None:
-        # Click + en la última fila para agregar nueva
-        try:
-            rows[-1].locator("button.addButton, button[title='Agregar']").first.click(force=True)
-            page.wait_for_timeout(800)
-            rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
-            rows = [r for r in rows if r.locator("ng-select").count() >= 2]
-            target_row = rows[-1]
-        except Exception as e:
-            raise RuntimeError(f"no pude agregar fila: {e}")
+        # FIX Error 1: abrir ng-select via coordenadas de mouse (no JS click)
+        # Primero eliminar filas no-Número para dejar solo la fila vacía
+        for r in non_numero_rows[:-1]:  # dejar la última como base
+            try:
+                del_btn = r.locator(
+                    "button.removeButton, button[title='Eliminar'], "
+                    "button[aria-label='Eliminar'], button[aria-label='Remove']"
+                ).first
+                del_btn.evaluate("el => el.click()")
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
 
-        # Configurar el campo en la fila nueva
+        # Refetch para obtener la fila que queda
+        rows = page.locator("tr").filter(has=page.locator("ng-select")).all()
+        rows = [r for r in rows if r.locator("ng-select").count() >= 2]
+        if not rows:
+            raise RuntimeError("no quedaron filas de criterios tras limpiar")
+
+        target_row = rows[-1]
         sels = target_row.locator("ng-select").all()
-        sels[0].click()
-        page.wait_for_timeout(400)
+
+        # Verificar si la fila ya tiene "Número de contacto" seleccionado
         try:
-            sels[0].locator(".ng-input input").first.fill("")
-            sels[0].locator(".ng-input input").first.type("número", delay=20)
+            existing_labels = sels[0].locator(".ng-value-label").all_inner_texts()
+            already_numero = any("número de contacto" in (l or "").lower() for l in existing_labels)
         except Exception:
-            pass
-        page.wait_for_timeout(600)
-        page.locator(".ng-option").filter(has_text=re.compile(r"n[uú]mero de contacto", re.I)).first.click()
-        page.wait_for_timeout(800)
+            already_numero = False
 
-    # Llenar el valor (input de texto en la última columna de la fila)
-    try:
-        inp = target_row.locator("input[type='text'], input:not([type])").last
-        inp.click()
-        inp.fill(numero)
-    except Exception as e:
-        raise RuntimeError(f"no pude llenar valor: {e}")
-    page.wait_for_timeout(500)
+        if not already_numero:
+            _ng_select_open_and_pick(
+                page, sels[0], re.compile(r"n[uú]mero de contacto", re.I), search_text="numer"
+            )
 
-    # Buscar
-    buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
-    buscar.wait_for(timeout=8000)
-    buscar.click(force=True)
-    # Esperar resultados
+    # Llenar el valor del número
+    inp = target_row.locator("input[type='text'], input:not([type])").last
+    inp.evaluate("el => el.scrollIntoView({block:'center'})")
+    inp.click()
+    inp.fill(numero)
+    page.wait_for_timeout(400)
+    buscar_loc.click(force=True)
     time.sleep(4)
 
 
-def _process_one_ticket(page, numero: str) -> List[str]:
-    """Filtra la bandeja por `numero`, abre el detalle en una NUEVA pestaña
-    (para no destruir el estado de la pestaña principal con go_back), extrae
-    URLs, cierra la pestaña del detalle."""
-    _search_by_numero(page, numero)
+def _navigate_to_bandeja_via_menu(page) -> None:
+    """Navega a bandeja clickeando Contactos → Bandeja de entrada (Angular router)."""
+    try:
+        btn = page.get_by_role("button", name=re.compile(r"^contactos$", re.I)).first
+        btn.wait_for(state="visible", timeout=8000)
+        btn.click()
+        time.sleep(1)
+        page.get_by_role("menuitem", name=re.compile(r"bandeja", re.I)).first.click()
+        time.sleep(3)
+    except Exception as e:
+        raise RuntimeError(f"no pude navegar a bandeja via menú: {e}")
 
-    # Verificar que aparece la fila con el número
+
+def _process_one_ticket(page, numero: str) -> List[str]:
+    """Busca el ticket en bandeja, hace click en 'Ver detalles' (Angular router —
+    no dispara OAuth), extrae adjuntos, y vuelve a bandeja con go_back()."""
+    _search_on_bandeja(page, numero)
+
     cell = page.locator("datatable-body-cell").filter(has_text=numero).first
     cell.wait_for(state="visible", timeout=10000)
     cell.click()
 
-    # Capturar el href del link "Ver detalles" en lugar de clickear (así abro
-    # en pestaña nueva manualmente y no toco la principal).
     link = page.get_by_role("link", name=re.compile(r"^\s*ver detalles\s*$", re.I)).first
     link.wait_for(state="visible", timeout=5000)
-    href = link.get_attribute("href")
-    if not href:
-        raise RuntimeError("link 'Ver detalles' no tiene href")
-    if href.startswith("/"):
-        href = BACKOFFICE_URL + href
+    detail_href = link.get_attribute("href") or ""
+    if detail_href.startswith("/"):
+        detail_href = BACKOFFICE_URL + detail_href
 
-    # Abrir detalle en NUEVA pestaña del mismo contexto (comparte cookies)
-    ctx = page.context
-    detail_page = ctx.new_page()
+    # Click en el link: Angular router navega al detalle SIN disparar OAuth
+    link.click()
+    time.sleep(4)
+
+    detail_url = page.url
     try:
-        detail_page.goto(href, wait_until="domcontentloaded", timeout=20000)
-        time.sleep(4)  # Angular hidrata
-        urls = _extract_urls_from_detail(detail_page)
+        urls = _extract_urls_from_detail(page, detail_url)
     finally:
+        # Volver a bandeja via go_back (Angular router popstate, no OAuth)
         try:
-            detail_page.close()
+            page.go_back()
+            time.sleep(3)
         except Exception:
             pass
+        # Si go_back no nos devolvió a bandeja, navegar via menú
+        if "/contacto/bandeja" not in (page.url or ""):
+            try:
+                _navigate_to_bandeja_via_menu(page)
+            except Exception:
+                pass
 
     return urls
 
@@ -283,69 +767,101 @@ def process_adjuntos(export_path: Path, spreadsheet_id: str) -> dict:
     if not candidates:
         return {"procesados": 0, "agregados": 0, "errores": 0, "candidatos_totales": total}
 
-    # 3. Conectar al browser CDP — el scraper ya dejó la sesión arriba
+    # 3. Conectar al browser (CDP o persistent según BROWSER_MODE)
     with sync_playwright() as p:
+        cleanup = None
+        if BROWSER_MODE == "cdp":
+            try:
+                browser = p.chromium.connect_over_cdp(CDP_URL)
+            except Exception as e:
+                log(f"⚠️  no pude conectar a {CDP_URL}: {e}")
+                return {"error": f"CDP: {e}", "candidatos_totales": total}
+            if not browser.contexts:
+                log("⚠️  el browser no tiene contextos.")
+                return {"error": "no contexts", "candidatos_totales": total}
+            ctx = browser.contexts[0]
+            cleanup = lambda: browser.close()
+        else:
+            USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=str(USER_DATA_DIR),
+                headless=HEADLESS,
+                slow_mo=150,
+                accept_downloads=True,
+                viewport={"width": 1280, "height": 900},
+                channel="chrome",
+            )
+            cleanup = lambda: ctx.close()
+
+        import notify as _notify
+
+        # 4. Autenticar UNA vez y obtener la pestaña de bandeja reutilizable.
+        #    _authenticate_and_goto_bandeja navega root → login si expiró → menú → bandeja.
+        #    El click en el menú usa Angular router (no dispara OAuth en futuros gotos).
+        bandeja_page = ctx.new_page()
         try:
-            browser = p.chromium.connect_over_cdp(CDP_URL)
+            _authenticate_and_goto_bandeja(bandeja_page)
         except Exception as e:
-            log(f"⚠️  no pude conectar a {CDP_URL}: {e}")
-            return {"error": f"CDP: {e}", "candidatos_totales": total}
-
-        if not browser.contexts:
-            log("⚠️  el browser no tiene contextos.")
-            return {"error": "no contexts", "candidatos_totales": total}
-        ctx = browser.contexts[0]
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
-        # Asegurar bandeja
-        if "/contacto/bandeja" not in page.url:
-            page.goto(f"{BACKOFFICE_URL}/contacto/bandeja")
-            time.sleep(5)
-        # Si la sesión expiró → vamos a ver Keycloak. Abort.
-        if "identidad-gcaba" in page.url:
-            log("⚠️  sesión expiró antes de empezar. Abort.")
-            return {"error": "session expired", "candidatos_totales": total}
-
-        # Si la grilla está vacía (volvimos a la bandeja sin Buscar previo), buscar
-        try:
-            buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
-            if buscar.is_visible(timeout=1500):
-                buscar.click(force=True)
-                time.sleep(5)
-        except Exception:
-            pass
+            log(f"⚠️  no pude autenticar/navegar a bandeja: {e!r}")
+            if cleanup:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+            return {"error": f"auth: {e}", "candidatos_totales": total}
 
         agregados = 0
         errores = 0
+        sin_urls: list = []
         for sheet_row, numero in candidates:
             try:
                 log(f"Procesando {numero} (fila {sheet_row})…")
-                urls = _process_one_ticket(page, numero)
+                urls = _process_one_ticket(bandeja_page, numero)
                 if urls:
                     ws.update_cell(sheet_row, col_adjuntos + 1, " | ".join(urls))
                     log(f"  ✓ {len(urls)} URL(s) escritas")
                     agregados += 1
                 else:
-                    log(f"  (no había adjuntos detectables — no escribo nada)")
+                    raise _NoUrlsError(f"{numero}: tiene adjuntos según CSV pero no se extrajo ninguna URL")
+            except _NoUrlsError as e:
+                log(f"  ✗ {e} — notificando y continuando con el siguiente.")
+                errores += 1
+                sin_urls.append(numero)
+                _notify.send_slack_error(
+                    f"⚠️ *Adjunto sin URL*: `{numero}` tiene archivos adjuntos según el CSV "
+                    f"pero no se pudo extraer ninguna URL desde el detalle. Revisar manualmente."
+                )
             except Exception as e:
                 log(f"  ✗ {numero}: {e!r}")
                 errores += 1
-                # Volver a la bandeja por las dudas
+                # Verificar si el contexto sigue vivo
+                context_alive = False
                 try:
-                    page.goto(f"{BACKOFFICE_URL}/contacto/bandeja")
-                    time.sleep(3)
-                    buscar = page.get_by_role("button", name=re.compile(r"^\s*buscar\s*$", re.I)).first
-                    if buscar.is_visible(timeout=1500):
-                        buscar.click(force=True)
-                        time.sleep(5)
+                    ctx.pages
+                    context_alive = True
+                except Exception:
+                    pass
+                if not context_alive:
+                    log("  ⚠️  contexto del browser muerto — deteniendo.")
+                    break
+                # Re-navegar a bandeja para el próximo ticket
+                try:
+                    if "/contacto/bandeja" not in (bandeja_page.url or ""):
+                        _navigate_to_bandeja_via_menu(bandeja_page)
                 except Exception:
                     pass
 
+        if cleanup:
+            try:
+                cleanup()
+            except Exception:
+                pass
         return {
             "procesados": len(candidates),
             "agregados": agregados,
             "errores": errores,
             "candidatos_totales": total,
+            "sin_urls": sin_urls,
         }
 
 
