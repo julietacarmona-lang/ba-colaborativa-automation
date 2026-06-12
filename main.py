@@ -17,11 +17,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+load_dotenv()  # cargar .env ANTES de importar módulos que leen env vars al inicio
+
 import notify
 import scraper
 import update_sheets
-
-load_dotenv()
 
 
 def log(msg: str) -> None:
@@ -75,4 +75,5 @@ if __name__ == "__main__":
     notify.send_success_message(
         added=stats["added"],
         total_in_export=stats["export_total"],
+        adjuntos_added=stats.get("adjuntos", {}).get("agregados", 0),
     )

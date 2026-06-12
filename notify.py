@@ -95,7 +95,7 @@ def send_slack_error(text: str) -> None:
     )
 
 
-def send_success_message(added: int, total_in_export: int) -> None:
+def send_success_message(added: int, total_in_export: int, adjuntos_added: int = 0) -> None:
     """Notifica a Slack solo si hay novedades reales (added > 0).
 
     Diseño:
@@ -109,6 +109,8 @@ def send_success_message(added: int, total_in_export: int) -> None:
         return
 
     text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
+    if adjuntos_added > 0:
+        text += f" Se cargaron *{adjuntos_added} adjuntos* nuevos."
     _force_send_slack(_with_sheet_link(text))
 
 

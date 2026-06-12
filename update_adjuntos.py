@@ -714,6 +714,10 @@ def process_adjuntos(export_path: Path, spreadsheet_id: str) -> dict:
         df[df["Contiene archivos adjuntos"].astype(str).str.strip().str.lower().isin(["si", "sí"])]["Número"]
         .astype(str).str.strip().tolist()
     )
+    csv_sin_adjunto = set(
+        df[~df["Contiene archivos adjuntos"].astype(str).str.strip().str.lower().isin(["si", "sí"])]["Número"]
+        .astype(str).str.strip().tolist()
+    )
     log(f"CSV: {len(csv_con_adjunto)} tickets con adjuntos")
 
     # 2. Leer Sheets, identificar candidatos
@@ -743,29 +747,39 @@ def process_adjuntos(export_path: Path, spreadsheet_id: str) -> dict:
         log("⚠️  Falta columna 'Adjuntos' en el Sheets.")
         return {"error": "missing Adjuntos"}
 
-    candidates = []  # (sheet_row_1indexed, numero)
+    candidates = []        # (sheet_row_1indexed, numero) — tienen adjuntos, sin URL todavía
+    sin_adj_rows = []      # sheet_row_1indexed — no tienen adjuntos, celda vacía
     for i, row in enumerate(all_rows[1:], start=2):
-        # row[i] puede no existir si la fila es corta — defensivo
         def cell(idx):
             return row[idx].strip() if idx < len(row) else ""
         numero = cell(col_numero)
-        resp = cell(col_resp_cerrada).lower()
         adj = cell(col_adjuntos)
         if not numero:
             continue
-        if numero not in csv_con_adjunto:
+        if adj:  # ya tiene algo (URL o "sin adjuntos") — no tocar
             continue
-        if resp in ("sí", "si"):
-            continue
-        if adj:  # ya tiene URL
-            continue
-        candidates.append((i, numero))
+        if numero in csv_con_adjunto:
+            resp = cell(col_resp_cerrada).lower()
+            if resp not in ("sí", "si"):
+                candidates.append((i, numero))
+        elif numero in csv_sin_adjunto:
+            sin_adj_rows.append(i)
+
+    # Marcar "sin adjuntos" en batch para tickets sin archivos
+    if sin_adj_rows:
+        log(f"Marcando {len(sin_adj_rows)} ticket(s) como 'sin adjuntos'…")
+        try:
+            cell_list = [gspread.Cell(r, col_adjuntos + 1, "sin adjuntos") for r in sin_adj_rows]
+            ws.update_cells(cell_list, value_input_option="RAW")
+            log(f"  ✓ {len(sin_adj_rows)} celdas marcadas.")
+        except Exception as e:
+            log(f"  ⚠️  batch update 'sin adjuntos' falló: {e}")
 
     total = len(candidates)
-    log(f"Candidatos: {total}. Proceso hasta {MAX_TICKETS_PER_RUN} en esta corrida.")
+    log(f"Candidatos con adjuntos: {total}. Proceso hasta {MAX_TICKETS_PER_RUN} en esta corrida.")
     candidates = candidates[:MAX_TICKETS_PER_RUN]
     if not candidates:
-        return {"procesados": 0, "agregados": 0, "errores": 0, "candidatos_totales": total}
+        return {"procesados": 0, "agregados": 0, "errores": 0, "candidatos_totales": total, "sin_adjuntos_marcados": len(sin_adj_rows)}
 
     # 3. Conectar al browser (CDP o persistent según BROWSER_MODE)
     with sync_playwright() as p:
@@ -862,6 +876,7 @@ def process_adjuntos(export_path: Path, spreadsheet_id: str) -> dict:
             "errores": errores,
             "candidatos_totales": total,
             "sin_urls": sin_urls,
+            "sin_adjuntos_marcados": len(sin_adj_rows),
         }
 
 
