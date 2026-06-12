@@ -178,6 +178,10 @@ def _load_credentials() -> Credentials:
     """
     raw_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if raw_json:
+        # Soporta tanto JSON directo como base64-encoded (evita corrupción en shell)
+        if not raw_json.startswith("{"):
+            import base64
+            raw_json = base64.b64decode(raw_json).decode("utf-8")
         info = json.loads(raw_json)
         return Credentials.from_service_account_info(info, scopes=SCOPES)
 
