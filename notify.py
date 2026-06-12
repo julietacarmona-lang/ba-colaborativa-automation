@@ -105,7 +105,7 @@ def send_success_message(added: int, total_in_export: int) -> None:
       cron (incluyendo los keep-alives silenciosos) tiene que avisar cuando
       hay novedades."""
     if added == 0:
-        print(f"[notify] 0 tickets nuevos — silencio (no mando Slack).")
+        print(f"[notify] 0 tickets nuevos — silencio (no mando Slack).", flush=True)
         return
 
     text = f"✅ BA Colaborativa: pipeline OK — *{added} tickets nuevos agregados* al Sheets. Hay {total_in_export} abiertos actualmente."
@@ -132,11 +132,11 @@ def _force_send_slack(text: str) -> None:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status >= 300:
-                print(f"[notify] Slack success (forced) respondió {resp.status}")
+                print(f"[notify] Slack success (forced) respondió {resp.status}", flush=True)
             else:
-                print(f"[notify] Slack success (forced) OK — había tickets nuevos")
+                print(f"[notify] Slack success (forced) OK — había tickets nuevos", flush=True)
     except Exception as e:
-        print(f"[notify] Slack success (forced) falló: {e}")
+        print(f"[notify] Slack success (forced) falló: {e}", flush=True)
 
 
 REFRESH_HINT_KEYWORDS = (
