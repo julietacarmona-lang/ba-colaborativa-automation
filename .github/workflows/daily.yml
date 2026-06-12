@@ -6,7 +6,8 @@ on:
   # chain se rompe NO satura mis-bots-notis (solo avisa el primer
   # fallo del chain).
   schedule:
-    - cron: "0 */2 * * *"
+    # Cada 2hs en horario laboral Argentina (8am–8pm, UTC-3 = 11–23 UTC)
+    - cron: "0 11,13,15,17,19,21,23 * * *"
   workflow_dispatch:
     inputs:
       skip_slack:
