@@ -6,7 +6,7 @@ on:
   # chain se rompe NO satura mis-bots-notis (solo avisa el primer
   # fallo del chain).
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       skip_slack:
