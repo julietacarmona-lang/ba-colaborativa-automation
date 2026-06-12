@@ -153,6 +153,38 @@ def _detect_auth_state(page: Page, timeout_s: float = 30.0) -> str:
         except Exception:
             pass
 
+        # Si el título o URL indican que el browser está navegando a Keycloak,
+        # esperar a que la navegación complete antes de buscar el form de login.
+        try:
+            title = page.title()
+            url = page.url
+            going_to_keycloak = (
+                "identidad-gcaba" in title
+                or "identidad-gcaba" in url
+            )
+            if going_to_keycloak:
+                try:
+                    page.wait_for_url("**/identidad-gcaba**", timeout=15000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                # Intentar detectar el form inmediatamente después de la navegación
+                try:
+                    if pw.first.is_visible(timeout=3000):
+                        return "login"
+                except Exception:
+                    pass
+                try:
+                    if login_text.first.is_visible(timeout=3000):
+                        return "login"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         page.wait_for_timeout(400)
 
     _dump_debug(page, "auth_unknown")
