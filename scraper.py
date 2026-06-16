@@ -90,6 +90,13 @@ class CaptchaRejectedError(Exception):
     aborta después de 2 ocurrencias consecutivas."""
 
 
+class PlatformDownError(Exception):
+    """BA Colaborativa no cargó contenido (Angular timeout + body vacío).
+    Indica probable caída de la plataforma — no es un bug del código.
+    download_tickets() aborta los reintentos inmediatamente: si está caída,
+    10 reintentos de 45s cada uno solo desperdiciarían tiempo de CI."""
+
+
 def is_logged_in(page: Page) -> bool:
     """Heurística robusta: estamos logueadas si y solo si la URL es del
     backoffice Y no se ve un input de password (que sería la pantalla de
@@ -273,6 +280,18 @@ def login(page: Page) -> None:
         log("✓ Angular hidratado.")
     except PlaywrightTimeoutError:
         log("⚠️  Angular no arrancó en 45s — sigo igual a ver qué dice el DOM.")
+        # Si el body sigue completamente vacío, la plataforma está caída.
+        # Abortar inmediatamente — no tiene sentido intentar detectar auth state.
+        try:
+            body_len = page.evaluate("() => document.body?.innerText?.length || 0")
+            if body_len == 0 and "bacolaborativa-backoffice" in page.url:
+                raise PlatformDownError(
+                    "Angular no arrancó y el body está vacío — BA Colaborativa parece estar caída."
+                )
+        except PlatformDownError:
+            raise
+        except Exception:
+            pass
 
     log("Detectando estado de autenticación…")
     state = _detect_auth_state(page, timeout_s=30.0)
@@ -1394,6 +1413,13 @@ def download_tickets() -> Path:
         log(f"Intento {attempt}/{MAX_ATTEMPTS}…")
         try:
             return _run_once()
+        except PlatformDownError as e:
+            # La plataforma está caída — no tiene sentido reintentar 10 veces.
+            # Cada intento tardaría 45s+ en timeout. Avisamos y salimos.
+            last_exc = e
+            log(f"⛔ Plataforma caída detectada en intento {attempt} — abortando reintentos. "
+                "El cron va a reintentar en la próxima ventana programada.")
+            break
         except CaptchaRejectedError as e:
             last_exc = e
             captcha_rejections += 1
@@ -1422,16 +1448,37 @@ def download_tickets() -> Path:
                 time.sleep(pause)
 
     # Llegamos acá solo si todos los intentos fallaron.
-    notify.send_failure_alert(
-        subject="[BA Colaborativa] Scraper falló después de reintentos",
-        body=(
-            f"El scraper no pudo descargar los tickets después de "
-            f"{MAX_ATTEMPTS} intentos.\n\n"
-            f"Último error: {last_exc!r}"
-        ),
-        exc=last_exc,
-    )
     assert last_exc is not None
+    if isinstance(last_exc, PlatformDownError):
+        # Alerta tranquila — no es un bug, es caída del GCBA.
+        notify.send_platform_down_alert()
+    elif isinstance(last_exc, CaptchaRejectedError):
+        # Loop circular: captcha falla → probable cookies vencidas → sin cookies nuevas.
+        # El mensaje incluye "captcha" para que _is_session_expired() lo detecte y
+        # le diga al equipo cómo arreglarlo (refresh-session.sh).
+        notify.send_failure_alert(
+            subject="[BA Colaborativa] Captcha no resolvible — probable sesión vencida",
+            body=(
+                "El solver de captcha no pudo pasar el score de Keycloak en "
+                f"{MAX_CAPTCHA_REJECTIONS} intentos seguidos.\n\n"
+                "Causa probable: las cookies de sesión expiraron y Keycloak "
+                "exige CAPTCHA al detectar un login 'frío' desde una IP de CI.\n\n"
+                "Para arreglarlo: corré ./scripts/refresh-session.sh desde tu compu "
+                "(genera cookies frescas y las sube como secret).\n\n"
+                f"Detalle técnico: {last_exc!r}"
+            ),
+            exc=last_exc,
+        )
+    else:
+        notify.send_failure_alert(
+            subject="[BA Colaborativa] Scraper falló después de reintentos",
+            body=(
+                f"El scraper no pudo descargar los tickets después de "
+                f"{MAX_ATTEMPTS} intentos.\n\n"
+                f"Último error: {last_exc!r}"
+            ),
+            exc=last_exc,
+        )
     raise last_exc
 
 

@@ -22,6 +22,7 @@ load_dotenv()  # cargar .env ANTES de importar módulos que leen env vars al ini
 import notify
 import scraper
 import update_sheets
+from scraper import PlatformDownError
 
 
 def log(msg: str) -> None:
@@ -63,6 +64,10 @@ def run() -> dict:
 if __name__ == "__main__":
     try:
         stats = run()
+    except PlatformDownError:
+        # Alerta ya enviada desde scraper.py — no duplicar.
+        log("ERROR: BA Colaborativa está caída. Próximo cron reintentará.")
+        sys.exit(1)
     except Exception as e:
         log(f"ERROR: {e}")
         notify.send_failure_alert(

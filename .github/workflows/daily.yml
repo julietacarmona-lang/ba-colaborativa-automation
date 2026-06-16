@@ -158,14 +158,32 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
         run: |
-          if [ -f downloads/session_refreshed.json ] && [ -n "$GH_TOKEN" ]; then
-            gh secret set BA_SESSION_JSON \
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️ GH_PAT no configurado — las cookies no se pueden renovar automáticamente."
+            if [ -n "$SLACK_WEBHOOK_URL_ERROR" ]; then
+              curl -sS -X POST -H 'Content-Type: application/json' \
+                --data '{"text":"⚠️ *BA Colaborativa*: Secret `GH_PAT` no está configurado. Las cookies de sesión NO se renuevan automáticamente — cuando expiren el pipeline va a empezar a fallar con captchas. Solucion: creá un PAT en GitHub y setealo como secret `GH_PAT`.","username":"BA Colaborativa Bot","icon_emoji":":warning:"}' \
+                "$SLACK_WEBHOOK_URL_ERROR" || true
+            fi
+            exit 0
+          fi
+          if [ -f downloads/session_refreshed.json ]; then
+            if gh secret set BA_SESSION_JSON \
               --body "$(cat downloads/session_refreshed.json)" \
-              --repo ${{ github.repository }}
-            echo "✓ Secret BA_SESSION_JSON actualizado con cookies frescas."
+              --repo ${{ github.repository }} 2>&1; then
+              echo "✓ Secret BA_SESSION_JSON actualizado con cookies frescas."
+            else
+              echo "⚠️ No pude actualizar BA_SESSION_JSON — GH_PAT puede estar expirado o sin permisos."
+              if [ -n "$SLACK_WEBHOOK_URL_ERROR" ]; then
+                curl -sS -X POST -H 'Content-Type: application/json' \
+                  --data '{"text":"⚠️ *BA Colaborativa*: No pude renovar las cookies en GitHub Secrets (GH_PAT expirado o sin permisos). Las cookies se van a degradar hasta que expire la sesión. Solución: regenerá el PAT en GitHub y actualizá el secret `GH_PAT`.","username":"BA Colaborativa Bot","icon_emoji":":warning:"}' \
+                  "$SLACK_WEBHOOK_URL_ERROR" || true
+              fi
+            fi
           else
-            echo "(no actualizo secret — falta el archivo o GH_PAT no configurado)"
+            echo "(no actualizo secret — falta session_refreshed.json)"
           fi
 
       - name: Upload exported file as artifact (on failure for debug)
@@ -218,12 +236,18 @@ jobs:
             if echo "$LOG" | grep -q "Usuario o contraseña incorrectos"; then
               DIAG="🔐 Keycloak rechazó las credenciales — probablemente cambió la password de Cecilia."
               ACCION="Actualizá el secret con: \`gh secret set BA_PASSWORD --repo ${{ github.repository }}\`"
+            elif echo "$LOG" | grep -qE "BA Colaborativa parece estar caída|PlatformDownError|Angular.*body.*vacío"; then
+              DIAG="🌩️ BA Colaborativa no cargó — probable caída momentánea de la plataforma del GCBA."
+              ACCION="No hace falta hacer nada. El cron va a reintentar automáticamente."
             elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal Server|backend.+ 5[0-9][0-9]"; then
               DIAG="🌩️ Backend del GCBA caído (5xx). No es nuestro problema."
               ACCION="Esperá 1-2h. La próxima corrida del cron probablemente pase."
-            elif echo "$LOG" | grep -qE "Error en el reCAPTCHA|captchas? rechazado"; then
+            elif echo "$LOG" | grep -qE "Error en el reCAPTCHA|captchas? rechazado|CaptchaRejectedError"; then
               DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score."
               ACCION="Es intermitente. Si persiste 4+ runs, refrescá la sesión: \`./scripts/refresh-session.sh\`"
+            elif echo "$LOG" | grep -qE "0 tickets.*export.*vacío|export.*0 filas|0 filas.*export"; then
+              DIAG="📭 El export descargado tiene 0 tickets — el filtro no devolvió resultados o el archivo está corrupto."
+              ACCION="Revisá el filtro en BA Colaborativa y fijate si la bandeja tiene tickets abiertos."
             elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.+selector|ng-select|addButton|modal.+Exportar"; then
               DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
               ACCION="Avisame para que investigue."

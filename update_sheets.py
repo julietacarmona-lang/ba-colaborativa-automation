@@ -43,6 +43,13 @@ def update_sheets(export_path: Path, spreadsheet_id: str) -> dict:
     df_export = _read_export(export_path)
     log(f"  {len(df_export)} filas en el export.")
 
+    if len(df_export) == 0:
+        raise RuntimeError(
+            "El export tiene 0 tickets. Puede indicar: plataforma inestable, "
+            "filtro que no devolvió resultados, o archivo descargado corrupto. "
+            "Revisá el archivo en ./downloads/ y el filtro aplicado en BA Colaborativa."
+        )
+
     if NUMBER_COL not in df_export.columns:
         raise RuntimeError(
             f"El export no tiene la columna '{NUMBER_COL}'. "

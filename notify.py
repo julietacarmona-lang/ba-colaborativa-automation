@@ -141,6 +141,18 @@ def _force_send_slack(text: str) -> None:
         print(f"[notify] Slack success (forced) falló: {e}", flush=True)
 
 
+def send_platform_down_alert() -> None:
+    """BA Colaborativa no cargó (Angular timeout + body vacío). Manda una
+    alerta tranquila al canal de errores — no es un bug del código, es caída
+    del GCBA. El cron va a reintentar en la próxima ventana."""
+    msg = (
+        "🌩️ *BA Colaborativa parece estar caída* — Angular no cargó y el body está vacío. "
+        "No es un error del pipeline. El cron va a reintentar automáticamente en la próxima corrida."
+    )
+    print("[notify] Plataforma caída — alertando al canal de errores.", flush=True)
+    send_slack_error(msg)
+
+
 REFRESH_HINT_KEYWORDS = (
     "captcha",
     "form de login",
