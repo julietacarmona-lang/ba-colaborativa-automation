@@ -1297,13 +1297,14 @@ def _run_once() -> Path:
 def _connect_cdp(p):
     """Se conecta a un Chrome ya corriendo con --remote-debugging-port.
 
-    Nota (2026-06-08): probamos inyectar BA_SESSION_JSON acá (cookies via
-    add_cookies + localStorage via add_init_script) para saltear el login
-    en CI. El SPA arrancaba autenticado (cookies bastan para Keycloak silent
-    SSO), pero TODOS los XHRs al backend GCS daban 401 — el id_token de
-    Cecilia desde la IP de su Mac no es aceptado por el backend desde la
-    IP de GitHub Actions, aunque el sessionId del JWT no haya expirado.
-    El intento quedó en commits 7350426 y 0e96b1b; revertidos en este file.
+    Si BA_SESSION_JSON está disponible, inyecta las cookies y el localStorage
+    en el contexto del Chrome recién conectado. Esto permite saltear el login
+    cuando la sesión de una corrida anterior sigue válida.
+
+    Nota importante: en 2026-06-08 intentamos esto con cookies generadas en la
+    Mac de Cecilia → el backend GCS daba 401 desde la IP de GitHub Actions.
+    Ahora las cookies son generadas POR el propio CI, así que la IP de origen
+    coincide y el backend las acepta.
     """
     log(f"Conectando por CDP a {CDP_URL}…")
     try:
@@ -1317,6 +1318,39 @@ def _connect_cdp(p):
         raise RuntimeError("El Chrome al que conectaste no tiene contextos activos.")
     context = browser.contexts[0]
     log(f"✓ Conectado. {len(context.pages)} pestaña(s) abierta(s).")
+
+    # Inyectar sesión previa si está disponible.
+    if BA_SESSION_JSON:
+        try:
+            state = json.loads(BA_SESSION_JSON)
+            cookies = state.get("cookies", [])
+            if cookies:
+                context.add_cookies(cookies)
+                log(f"✓ {len(cookies)} cookie(s) inyectadas desde BA_SESSION_JSON.")
+            # localStorage: se inyecta vía init_script para que esté listo
+            # cuando login() navegue al backoffice (Angular lo lee al arrancar).
+            origins = state.get("origins", [])
+            injected_origins = 0
+            for origin_data in origins:
+                origin = origin_data.get("origin", "")
+                ls_items = origin_data.get("localStorage", [])
+                if ls_items and (BACKOFFICE_URL in origin or "identidad-gcaba" in origin):
+                    items_json = json.dumps(ls_items)
+                    origin_json = json.dumps(origin)
+                    context.add_init_script(f"""
+                        (() => {{
+                            if (location.origin !== {origin_json}) return;
+                            const items = {items_json};
+                            items.forEach(item => {{
+                                try {{ localStorage.setItem(item.name, item.value); }} catch(e) {{}}
+                            }});
+                        }})();
+                    """)
+                    injected_origins += 1
+            if injected_origins:
+                log(f"  {injected_origins} origen(es) de localStorage preparados.")
+        except Exception as e:
+            log(f"⚠️  No pude inyectar BA_SESSION_JSON: {e!r} — sigo sin sesión previa.")
 
     def cleanup():
         # NO cerramos Chrome — es el browser de la usuaria. Solo desconectamos.
