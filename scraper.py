@@ -550,14 +550,85 @@ def _real_captcha_challenge(page: Page) -> bool:
     return False
 
 
+def _get_site_key(page: Page) -> Optional[str]:
+    """Extrae el sitekey de reCAPTCHA Enterprise de la página actual."""
+    return page.evaluate("""
+        () => {
+            const el = document.querySelector('.g-recaptcha[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            const iframe = document.querySelector('iframe[src*="recaptcha"]');
+            if (iframe) {
+                const m = iframe.src.match(/[?&]k=([^&]+)/);
+                if (m) return m[1];
+            }
+            // Buscar en scripts inline — Keycloak lo embebe como variable JS
+            const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+            for (const s of scripts) {
+                const m = s.textContent.match(/(?:siteKey|site_key|sitekey)['"\\s]*[:=]['"\\s]*([\\w-]{30,})/i);
+                if (m) return m[1];
+            }
+            try { return localStorage.getItem('captchaSiteKey'); } catch (e) { return null; }
+        }
+    """)
+
+
+def _solve_captcha_native(page: Page, site_key: str) -> Optional[str]:
+    """Genera el token reCAPTCHA directamente desde Chrome (misma IP y fingerprint
+    que el runner de GitHub Actions). Mucho mejor score que CapSolver porque Google
+    evalúa el comportamiento real del browser, no un solver externo.
+
+    Retorna el token string o None si grecaptcha.enterprise no está disponible."""
+    log("🔑 Native reCAPTCHA: generando token desde Chrome…")
+    try:
+        token = page.evaluate("""
+            (siteKey) => new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('timeout 20s')), 20000);
+                const tryExecute = () => {
+                    if (window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.ready) {
+                        window.grecaptcha.enterprise.ready(() => {
+                            window.grecaptcha.enterprise.execute(siteKey, {action: 'login'})
+                                .then(t => { clearTimeout(timeout); resolve(t); })
+                                .catch(e => { clearTimeout(timeout); reject(e); });
+                        });
+                    } else {
+                        clearTimeout(timeout);
+                        reject(new Error('grecaptcha.enterprise no disponible'));
+                    }
+                };
+                // Si el script aún está cargando, esperar un tick
+                if (document.readyState === 'complete') {
+                    tryExecute();
+                } else {
+                    window.addEventListener('load', tryExecute, {once: true});
+                }
+            })
+        """, site_key)
+        if token:
+            log(f"✓ Native token generado ({len(token)} chars)")
+            return token
+    except Exception as e:
+        log(f"⚠️  Native reCAPTCHA falló: {e!r}")
+    return None
+
+
 def _solve_captcha(page: Page) -> None:
-    """Resuelve el captcha. Prueba CapSolver primero (mejor con Enterprise V3),
-    cae a anti-captcha si CapSolver falla o no está configurado, y al modo
-    manual si no hay ninguna API key."""
+    """Resuelve el captcha. Orden de prioridad:
+    1. Native: genera el token desde Chrome mismo (mejor score — misma IP del runner).
+    2. CapSolver: solver externo (token de IP distinta, Keycloak lo rechaza frecuente).
+    3. Manual: fallback en modo headful si no hay API keys."""
     import importlib
 
-    # Orden importa: CapSolver primero porque sus tokens pasan el threshold
-    # del GCBA y los de anti-captcha vienen siendo rechazados.
+    site_key = _get_site_key(page)
+    if not site_key:
+        raise RuntimeError("No pude detectar el sitekey del reCAPTCHA en la página.")
+
+    # 1. Native: el mejor score posible — Chrome real, IP real del runner.
+    native_token = _solve_captcha_native(page, site_key)
+    if native_token:
+        _inject_token_and_submit(page, native_token)
+        return
+
+    # 2. Solvers externos (CapSolver / Anti-captcha) — fallback si native no funciona.
     providers = []
     if os.environ.get("CAPSOLVER_API_KEY", "").strip():
         providers.append(("CapSolver", "CAPSOLVER_API_KEY", "capsolver"))
@@ -568,22 +639,7 @@ def _solve_captcha(page: Page) -> None:
         _wait_for_manual_captcha_solve(page)
         return
 
-    site_key = page.evaluate("""
-        () => {
-            const el = document.querySelector('.g-recaptcha[data-sitekey]');
-            if (el) return el.getAttribute('data-sitekey');
-            const iframe = document.querySelector('iframe[src*="recaptcha"]');
-            if (iframe) {
-                const m = iframe.src.match(/[?&]k=([^&]+)/);
-                if (m) return m[1];
-            }
-            try { return localStorage.getItem('captchaSiteKey'); } catch (e) { return null; }
-        }
-    """)
-    if not site_key:
-        raise RuntimeError("No pude detectar el sitekey del reCAPTCHA en la página.")
     site_url = page.url
-
     last_err: Optional[BaseException] = None
     for label, env_var, module_name in providers:
         try:
