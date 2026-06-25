@@ -1,0 +1,32 @@
+name: Renovar sesión BA Colaborativa
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_data:
+        description: 'Session JSON capturado por el bookmarklet'
+        required: true
+
+jobs:
+  renovar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Actualizar BA_SESSION_JSON con la sesión nueva
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          SESSION_DATA: ${{ github.event.inputs.session_data }}
+        run: |
+          gh secret set BA_SESSION_JSON \
+            --body "$SESSION_DATA" \
+            --repo ${{ github.repository }}
+          echo "✅ BA_SESSION_JSON actualizado con sesión fresca."
+
+      - name: Avisar a Slack que la sesión fue renovada
+        if: ${{ env.SLACK_WEBHOOK_URL_ERROR != '' }}
+        env:
+          SLACK_WEBHOOK_URL_ERROR: ${{ secrets.SLACK_WEBHOOK_URL_ERROR }}
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data '{"text":"🔑 *Sesión de BA Colaborativa renovada* — las cookies fueron actualizadas. El bot debería volver a funcionar normalmente.","username":"BA Colaborativa Bot","icon_emoji":":key:"}' \
+            "$SLACK_WEBHOOK_URL_ERROR" || true

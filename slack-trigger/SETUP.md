@@ -1,7 +1,12 @@
-# Setup: Comando /bajada-tickets en Slack
+# Setup: Comandos de Slack para BA Colaborativa
 
-Permite que cualquier persona en el canal de Slack escriba `/bajada-tickets`
-y el bot arranca. A los ~5 minutos llega la notificación de resultado.
+Permite que cualquier persona en el canal escriba comandos de Slack para operar el bot.
+
+| Comando | Para qué sirve |
+|---|---|
+| `/bajada-tickets` | Arranca el bot ahora (sin esperar el cron) |
+| `/estado-bot` | Muestra si las últimas corridas anduvieron bien |
+| `/renovar-sesion` | Explica cómo renovar las cookies si el bot no puede loguearse |
 
 ---
 
@@ -11,71 +16,115 @@ y el bot arranca. A los ~5 minutos llega la notificación de resultado.
 2. Nombre: `BA Colaborativa Bot`
 3. Workspace: elegir el workspace del equipo
 
-### Configurar el slash command (después del Paso 2)
-En la app → **Slash Commands** → **Create New Command**:
-- Command: `/bajada-tickets`
-- Request URL: `https://ba-trigger.TU_SUBDOMINIO.workers.dev` ← vas a tener esta URL después del Paso 2
-- Short description: `Dispara la bajada de tickets de BA Colaborativa`
+### Crear los slash commands (después del Paso 2, cuando tengas la URL del Worker)
+
+En la app → **Slash Commands** → **Create New Command** × 3:
+
+| Command | Request URL | Description |
+|---|---|---|
+| `/bajada-tickets` | `https://lively-pond-17cd.julieta-carmona.workers.dev` | Dispara la bajada de tickets |
+| `/estado-bot` | `https://lively-pond-17cd.julieta-carmona.workers.dev` | Ver estado de las últimas corridas |
+| `/renovar-sesion` | `https://lively-pond-17cd.julieta-carmona.workers.dev` | Instrucciones para renovar cookies |
 
 ### Instalar la app
 **OAuth & Permissions** → **Install to Workspace** → Autorizar
 
 ### Copiar el Signing Secret
-**Basic Information** → **Signing Secret** → copiar (lo necesitás en Paso 2)
+**Basic Information** → **Signing Secret** → copiar
 
 ---
 
-## Paso 2 — Deploy del Worker en Cloudflare (gratis)
+## Paso 2 — Configurar el Worker en Cloudflare
 
-1. Crear cuenta en https://cloudflare.com (gratis)
-2. Ir a **Workers & Pages** → **Create** → **Create Worker**
-3. Nombrar el worker: `ba-trigger`
-4. Clickear **Edit code** y pegar el contenido de `worker.js`
-5. **Save and deploy**
+El Worker ya existe en `https://lively-pond-17cd.julieta-carmona.workers.dev`.
 
-### Configurar los secrets
-En el Worker → **Settings** → **Variables** → **Add variable** (marcar como Secret):
+Para actualizar el código: Cloudflare Dashboard → Workers → `lively-pond-17cd` → Edit Code → pegar `worker.js`.
+
+### Secrets a configurar en el Worker
+
+Workers → `lively-pond-17cd` → **Settings** → **Variables** → **Add variable** (marcar como Secret):
 
 | Variable | Valor |
 |---|---|
-| `SLACK_SIGNING_SECRET` | El signing secret del Paso 1 |
-| `GITHUB_TOKEN` | PAT de GitHub con scope `workflow` (ver abajo) |
+| `SLACK_SIGNING_SECRET` | Signing Secret de la Slack App (Paso 1) |
+| `GITHUB_TOKEN` | PAT de GitHub (ver abajo) |
+| `REFRESH_TOKEN` | Cualquier string largo y aleatorio — **anotalo**, lo necesitás para el bookmarklet |
+
+**Cómo crear el `REFRESH_TOKEN`**: inventá algo del tipo `ba-renovar-AbCd1234xYzW` (mínimo 20 caracteres). No se puede recuperar, así que guardalo.
 
 ### Cómo crear el GitHub PAT
 1. Ir a https://github.com/settings/tokens → **Generate new token (classic)**
 2. Nombre: `slack-trigger-ba`
-3. Scope: tildar solo `workflow`
-4. Expiration: 1 year (o "No expiration")
+3. Scopes: tildar `workflow` + `repo`
+4. Expiration: 1 year
 5. Copiar el token (empieza con `ghp_...`)
 
 ---
 
-## Paso 3 — Actualizar la Slack App con la URL del Worker
+## Paso 3 — Crear el bookmarklet de renovación
 
-1. En Cloudflare, copiar la URL del worker (algo como `https://ba-trigger.TU.workers.dev`)
-2. En la Slack App → **Slash Commands** → editar `/bajada-tickets`
-3. Pegar la URL en **Request URL**
-4. Guardar
+El bookmarklet le permite a cualquier persona renovar las cookies del bot desde su browser,
+sin necesidad de terminal ni acceso técnico.
+
+Reemplazá `TU_REFRESH_TOKEN_AQUI` con el valor de `REFRESH_TOKEN` que elegiste arriba,
+luego usá ese texto como URL de un bookmark en el browser:
+
+```
+javascript:(function(){if(!location.hostname.includes('bacolaborativa-backoffice')){alert('⚠️ Abrí este bookmark estando en BA Colaborativa, no en otra página.');return;}var s={origins:[{origin:location.origin,localStorage:Object.entries(localStorage).map(([k,v])=>({name:k,value:v})),sessionStorage:Object.entries(sessionStorage).map(([k,v])=>({name:k,value:v}))}]};fetch('https://lively-pond-17cd.julieta-carmona.workers.dev/renovar',{method:'POST',headers:{'Content-Type':'application/json','X-Refresh-Token':'TU_REFRESH_TOKEN_AQUI'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>alert(d.ok?'✅ Sesión renovada correctamente. El bot va a volver a funcionar en la próxima corrida.':'❌ Error al renovar: '+(d.error||'desconocido'))).catch(e=>alert('❌ Error de conexión: '+e));})();
+```
+
+### Cómo guardar el bookmark en Chrome / Edge
+1. Copiá el texto de arriba (con tu REFRESH_TOKEN ya reemplazado)
+2. Click derecho en la barra de favoritos → **Agregar página** (o presioná Ctrl+D)
+3. Nombre: `🔑 Renovar sesión bot`
+4. URL: pegá el texto del bookmarklet
+5. Guardar
+
+### Cómo usar el bookmarklet
+1. Ir a BA Colaborativa y loguearse normalmente
+2. Cuando cargue la pantalla principal → click en el bookmark `🔑 Renovar sesión bot`
+3. Esperar el cartel de confirmación `✅ Sesión renovada`
+4. En ~2 minutos el bot puede volver a loguearse
 
 ---
 
-## Paso 4 — Invitar al bot al canal
+## Paso 4 — Crear el slash command `/renovar-sesion`
 
-En el canal de Slack donde ya están las notificaciones:
+Igual que los otros: **Slash Commands** → **Create New Command**:
+- Command: `/renovar-sesion`
+- Request URL: `https://lively-pond-17cd.julieta-carmona.workers.dev`
+- Description: `Instrucciones para renovar las cookies de login del bot`
+
+---
+
+## Paso 5 — Invitar al bot al canal
+
+En el canal de Slack donde llegan las notificaciones:
 ```
 /invite @BA Colaborativa Bot
 ```
 
 ---
 
-## Uso
+## Flujo de escalada para la persona no técnica
 
-Cualquier persona en el canal escribe:
 ```
-/bajada-tickets
+Bot falla una vez
+    → Escribí /bajada-tickets para reintentar
+
+Sigue fallando varias corridas
+    → Escribí /estado-bot para ver qué pasa
+    → Si dice "captcha" o "sesión" → /renovar-sesion y seguí los pasos del bookmarklet
+    → Si otro error → avisá a quien administra el bot
 ```
 
-El bot responde inmediatamente:
-> ▶️ Bot BA Colaborativa arrancando! En ~5 minutos llega la notificación.
+---
 
-Y a los ~5 minutos llega la notificación de éxito o error al canal, igual que con el cron automático.
+## Notas técnicas
+
+- El Worker también expone `POST /renovar` (usado por el bookmarklet, no por Slack)
+- El secret `REFRESH_TOKEN` protege ese endpoint — sin él, nadie puede enviar cookies al bot
+- El bookmarklet captura `localStorage` y `sessionStorage` de BA Colaborativa
+  (Keycloak guarda los JWT tokens ahí — son suficientes para autenticar al bot)
+- El workflow `renovar-sesion.yml` recibe los datos y actualiza el secret `BA_SESSION_JSON` vía `gh secret set`
+- Requiere que el GitHub PAT tenga scope `repo` (para actualizar secrets)
