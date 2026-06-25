@@ -32,6 +32,11 @@ export default {
       return handleRenovar(request, env);
     }
 
+    // Página de instalación del bookmarklet (GET con token)
+    if (request.method === "GET" && url.pathname === "/setup") {
+      return handleSetupPage(url, env);
+    }
+
     // Todo lo demás: slash commands de Slack
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
@@ -50,7 +55,7 @@ export default {
 
     if (command === "/bajada-tickets") return handleTrigger(env);
     if (command === "/estado-bot")     return handleEstado(env);
-    if (command === "/renovar-sesion") return handleRenovarSlack();
+    if (command === "/renovar-sesion") return handleRenovarSlack(env);
 
     return slackResponse(`Comando no reconocido: ${command}`);
   },
@@ -105,22 +110,81 @@ async function handleEstado(env) {
   return slackResponse(`${header}\n${lines.join("\n")}${hint}`, true);
 }
 
-// ─── /renovar-sesion — instrucciones para el bookmarklet ──────────────────────
+// ─── /renovar-sesion — manda link a la página de instalación ─────────────────
 
-function handleRenovarSlack() {
+function handleRenovarSlack(env) {
+  const setupUrl = `https://lively-pond-17cd.julieta-carmona.workers.dev/setup?t=${env.REFRESH_TOKEN}`;
   const text = [
     "🔑 *Renovar sesión de BA Colaborativa*",
     "",
-    "Hacé esto una sola vez desde tu browser:",
-    "1. Abrí BA Colaborativa: <https://bacolaborativa-backoffice.buenosaires.gob.ar|Clic acá para ir>",
-    "2. Logueate con tu usuario y contraseña (igual que siempre)",
-    "3. Cuando cargue la pantalla principal, hacé clic en el bookmark *🔑 Renovar sesión bot* que tenés en favoritos",
-    "4. Vas a ver un cartelito de confirmación en la pantalla",
-    "5. Listo — en ~2 minutos el bot ya puede usar las cookies nuevas. Probá con */bajada-tickets*",
+    "*¿Primera vez? Guardá el bookmark (una sola vez):*",
+    `<${setupUrl}|➡️ Abrí esta página y seguí los pasos>`,
     "",
-    "_¿No tenés el bookmark guardado? Pedíselo a quien configuró el bot._",
+    "*¿Ya tenés el bookmark guardado?*",
+    "1. Abrí <https://bacolaborativa-backoffice.buenosaires.gob.ar|BA Colaborativa> y logueate",
+    "2. Hacé clic en el bookmark *🔑 Renovar sesión bot* de tus favoritos",
+    "3. Vas a ver un cartelito de confirmación",
+    "4. Probá con */bajada-tickets* — ya debería andar",
   ].join("\n");
   return slackResponse(text, true);
+}
+
+// ─── GET /setup — página de instalación del bookmarklet ──────────────────────
+
+function handleSetupPage(url, env) {
+  const token = url.searchParams.get("t") || "";
+  if (!env.REFRESH_TOKEN || token !== env.REFRESH_TOKEN) {
+    return new Response("No autorizado", { status: 401 });
+  }
+
+  const workerUrl = "https://lively-pond-17cd.julieta-carmona.workers.dev";
+  const bookmarkletCode = `javascript:(function(){if(!location.hostname.includes('bacolaborativa-backoffice')){alert('⚠️ Abrí este bookmark estando en BA Colaborativa, no en otra página.');return;}var s={origins:[{origin:location.origin,localStorage:Object.entries(localStorage).map(([k,v])=>({name:k,value:v})),sessionStorage:Object.entries(sessionStorage).map(([k,v])=>({name:k,value:v}))}]};fetch('${workerUrl}/renovar',{method:'POST',headers:{'Content-Type':'application/json','X-Refresh-Token':'${token}'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>alert(d.ok?'✅ Sesión renovada. El bot va a volver a funcionar en la próxima corrida.':'❌ Error: '+(d.error||'desconocido'))).catch(e=>alert('❌ Error de conexión: '+e));})();`;
+
+  const html = `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>🔑 Renovar sesión — BA Colaborativa Bot</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; }
+    h1 { color: #2A205E; }
+    .step { background: #f4f4f8; border-radius: 8px; padding: 16px 20px; margin: 16px 0; }
+    .step h2 { margin: 0 0 8px; font-size: 1rem; color: #2A205E; }
+    .bookmarklet-link { display: inline-block; background: #2A205E; color: white !important; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-size: 1.1rem; cursor: grab; border: 2px dashed #00C4B4; margin: 8px 0; }
+    .bookmarklet-link:hover { background: #00C4B4; }
+    .note { font-size: 0.85rem; color: #666; margin-top: 8px; }
+    .badge { display: inline-block; background: #00C4B4; color: white; border-radius: 12px; padding: 2px 10px; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <h1>🔑 Renovar sesión del bot</h1>
+  <p>Cuando el bot de BA Colaborativa no puede loguearse, esto lo arregla. Tarda 1 minuto.</p>
+
+  <div class="step">
+    <h2>Paso 1 — Guardar el bookmark <span class="badge">solo una vez</span></h2>
+    <p>Arrastrá este botón a tu barra de favoritos del browser:</p>
+    <a class="bookmarklet-link" href="${bookmarkletCode}">🔑 Renovar sesión bot</a>
+    <p class="note">¿No podés arrastrarlo? Hacé clic derecho → "Guardar enlace como marcador" (o "Bookmark this link").</p>
+  </div>
+
+  <div class="step">
+    <h2>Paso 2 — Úsalo cuando el bot falla</h2>
+    <ol>
+      <li>Ir a <a href="https://bacolaborativa-backoffice.buenosaires.gob.ar" target="_blank">BA Colaborativa</a> y loguearte normalmente</li>
+      <li>Cuando cargue la pantalla, hacer clic en el bookmark <strong>🔑 Renovar sesión bot</strong></li>
+      <li>Vas a ver un cartelito de confirmación en pantalla</li>
+      <li>En ~2 minutos el bot puede volver a funcionar — probá con <code>/bajada-tickets</code> en Slack</li>
+    </ol>
+  </div>
+
+  <p class="note">Este link es privado — no lo compartas.</p>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=UTF-8" },
+  });
 }
 
 // ─── POST /renovar — llamado por el bookmarklet ───────────────────────────────
