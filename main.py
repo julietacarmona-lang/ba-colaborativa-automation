@@ -22,7 +22,7 @@ load_dotenv()  # cargar .env ANTES de importar módulos que leen env vars al ini
 import notify
 import scraper
 import update_sheets
-from scraper import PlatformDownError
+from scraper import CaptchaRejectedError, PlatformDownError
 
 
 def log(msg: str) -> None:
@@ -68,11 +68,26 @@ if __name__ == "__main__":
         # Alerta ya enviada desde scraper.py — no duplicar.
         log("ERROR: BA Colaborativa está caída. Próximo cron reintentará.")
         sys.exit(1)
+    except CaptchaRejectedError as e:
+        log(f"ERROR: {e}")
+        notify.send_failure_alert(
+            subject="[BA Colaborativa] Captcha no resolvible — probable sesión vencida",
+            body=(
+                "El solver de captcha no pudo pasar el score de Keycloak.\n\n"
+                "Causa probable: las cookies de sesión expiraron y Keycloak "
+                "exige CAPTCHA al detectar un login 'frío' desde una IP de CI.\n\n"
+                "Para arreglarlo: corré ./scripts/refresh-session.sh desde tu compu "
+                "(genera cookies frescas y las sube como secret).\n\n"
+                f"Detalle técnico: {e!r}"
+            ),
+            exc=e,
+        )
+        sys.exit(1)
     except Exception as e:
         log(f"ERROR: {e}")
         notify.send_failure_alert(
-            subject="[BA Colaborativa] Pipeline falló",
-            body=f"El orquestador falló con: {e!r}",
+            subject="[BA Colaborativa] Scraper falló después de reintentos",
+            body=f"El scraper no pudo descargar los tickets.\n\nÚltimo error: {e!r}",
             exc=e,
         )
         sys.exit(1)

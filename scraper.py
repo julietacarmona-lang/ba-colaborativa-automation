@@ -97,6 +97,11 @@ class PlatformDownError(Exception):
     10 reintentos de 45s cada uno solo desperdiciarían tiempo de CI."""
 
 
+class ChromeDeadError(Exception):
+    """El proceso Chrome se cayó durante una operación CDP (page/context/browser cerrado).
+    download_tickets() lo captura, reinicia Chrome y reintenta."""
+
+
 def is_logged_in(page: Page) -> bool:
     """Heurística robusta: estamos logueadas si y solo si la URL es del
     backoffice Y no se ve un input de password (que sería la pantalla de
@@ -1477,6 +1482,72 @@ def _launch_persistent(p):
     return context, cleanup
 
 
+def _restart_cdp_chrome() -> None:
+    """Mata el Chrome muerto en port 9222 y lanza uno nuevo. Solo actúa en
+    BROWSER_MODE=cdp (CI). En local no toca nada para no matar Chrome del usuario."""
+    if BROWSER_MODE != "cdp":
+        return
+    import subprocess
+    import urllib.request as _ur
+
+    log("🔄 Reiniciando Chrome CDP…")
+    for sig in ("TERM", "KILL"):
+        try:
+            r = subprocess.run(
+                ["pkill", f"-{sig}", "-f", "remote-debugging-port=9222"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                break
+        except Exception:
+            pass
+    time.sleep(2)
+
+    chrome_bin = None
+    for candidate in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+        try:
+            r = subprocess.run(["which", candidate], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                chrome_bin = candidate
+                break
+        except Exception:
+            pass
+    if not chrome_bin:
+        raise RuntimeError("No encontré Chrome/Chromium instalado para reiniciarlo.")
+
+    profile_dir = "/tmp/chrome-cdp-restart"
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    cmd = [
+        chrome_bin,
+        "--remote-debugging-port=9222",
+        f"--user-data-dir={profile_dir}",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-gpu",
+        "about:blank",
+    ]
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":99")
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"Chrome reiniciado (PID={proc.pid})")
+    except Exception as e:
+        raise RuntimeError(f"No pude lanzar {chrome_bin}: {e}") from e
+
+    for i in range(30):
+        time.sleep(1)
+        try:
+            with _ur.urlopen("http://localhost:9222/json/version", timeout=2) as resp:
+                if resp.status == 200:
+                    log(f"✓ Chrome CDP listo (intento {i+1}/30)")
+                    return
+        except Exception:
+            pass
+    raise RuntimeError("Chrome no respondió en CDP después de 30s.")
+
+
 def download_tickets() -> Path:
     """Corre el scraper con reintentos. Si todos los intentos fallan,
     manda un mail de alerta y re-raisea la excepción original."""
@@ -1527,7 +1598,21 @@ def download_tickets() -> Path:
             time.sleep(wait_s)
         except Exception as e:
             last_exc = e
+            err_str = str(e)
+            chrome_died = any(p in err_str for p in (
+                "Target page, context or browser has been closed",
+                "Target closed",
+                "browser has been closed",
+            ))
             log(f"Intento {attempt} falló: {e!r}")
+            if chrome_died and BROWSER_MODE == "cdp" and attempt < MAX_ATTEMPTS:
+                log("⚠️  Chrome se cayó — reiniciando antes del próximo intento…")
+                try:
+                    _restart_cdp_chrome()
+                    log("✓ Chrome reiniciado. Próximo intento sin espera adicional.")
+                    continue
+                except Exception as restart_err:
+                    log(f"No pude reiniciar Chrome: {restart_err}. Sigo con espera normal.")
             if attempt < MAX_ATTEMPTS:
                 # Los 2 primeros fallos suelen ser captcha/timing — reintento
                 # rápido. Si seguimos fallando, la plataforma está caída
@@ -1540,35 +1625,9 @@ def download_tickets() -> Path:
     # Llegamos acá solo si todos los intentos fallaron.
     assert last_exc is not None
     if isinstance(last_exc, PlatformDownError):
-        # Alerta tranquila — no es un bug, es caída del GCBA.
         notify.send_platform_down_alert()
-    elif isinstance(last_exc, CaptchaRejectedError):
-        # Loop circular: captcha falla → probable cookies vencidas → sin cookies nuevas.
-        # El mensaje incluye "captcha" para que _is_session_expired() lo detecte y
-        # le diga al equipo cómo arreglarlo (refresh-session.sh).
-        notify.send_failure_alert(
-            subject="[BA Colaborativa] Captcha no resolvible — probable sesión vencida",
-            body=(
-                "El solver de captcha no pudo pasar el score de Keycloak en "
-                f"{MAX_CAPTCHA_REJECTIONS} intentos seguidos.\n\n"
-                "Causa probable: las cookies de sesión expiraron y Keycloak "
-                "exige CAPTCHA al detectar un login 'frío' desde una IP de CI.\n\n"
-                "Para arreglarlo: corré ./scripts/refresh-session.sh desde tu compu "
-                "(genera cookies frescas y las sube como secret).\n\n"
-                f"Detalle técnico: {last_exc!r}"
-            ),
-            exc=last_exc,
-        )
-    else:
-        notify.send_failure_alert(
-            subject="[BA Colaborativa] Scraper falló después de reintentos",
-            body=(
-                f"El scraper no pudo descargar los tickets después de "
-                f"{MAX_ATTEMPTS} intentos.\n\n"
-                f"Último error: {last_exc!r}"
-            ),
-            exc=last_exc,
-        )
+    # CaptchaRejectedError y errores genéricos: main.py envía la notificación
+    # para evitar duplicados (antes: scraper notificaba Y main notificaba = 2 Slacks).
     raise last_exc
 
 

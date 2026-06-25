@@ -6,8 +6,9 @@ on:
   # chain se rompe NO satura mis-bots-notis (solo avisa el primer
   # fallo del chain).
   schedule:
-    # 3 veces por día: 8am, 12pm y 16pm hora Argentina (UTC-3 = 11, 15, 19 UTC)
-    - cron: "0 11,15,19 * * *"
+    # Cada 4 horas en horario laboral Argentina (UTC-3):
+    # 8am, 12pm, 4pm, 8pm = 11, 15, 19, 23 UTC
+    - cron: "0 11,15,19,23 * * *"
   workflow_dispatch:
     inputs:
       skip_slack:
@@ -54,7 +55,7 @@ jobs:
       # 10 intentos por corrida. Después de N fallos consecutivos con captcha,
       # Keycloak eventualmente skipea y la corrida pasa. 10 chances le dan más
       # margen para esa "suerte" sin gastarnos más que ~$0.05/día en CapSolver.
-      MAX_ATTEMPTS: "10"
+      MAX_ATTEMPTS: "5"
       SAVED_FILTER_NAME: ${{ vars.SAVED_FILTER_NAME || 'Asignados a Milton' }}
 
       # Feature 2026-06-08: procesar URLs de adjuntos al final del cron.
@@ -135,6 +136,9 @@ jobs:
             --no-first-run \
             --disable-dev-shm-usage \
             --no-sandbox \
+            --disable-gpu \
+            --disable-software-rasterizer \
+            --disable-extensions \
             'about:blank' &
           # Esperar a que el puerto CDP esté listo (max 30s)
           for i in {1..30}; do
