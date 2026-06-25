@@ -198,15 +198,9 @@ jobs:
           path: downloads/
           if-no-files-found: ignore
 
-      - name: Avisar a Slack y, si es 2da falla seguida, pausar el cron
-        # Regla 2026-06-08:
-        #  - CADA error notifica a mis-bots-notis (con emoji según gravedad).
-        #  - 1er fail del chain (anterior fue success) → ⚠️ amarilla, el cron sigue.
-        #  - 2do fail consecutivo → 🚨 roja + se PAUSA el cron (gh workflow disable).
-        #    Cuando Juli arregle y corra refresh-session.sh, el script reactiva
-        #    el cron (gh workflow enable + run).
-        # Si el job se canceló (timeout 45min), GitHub mata Python antes
-        # de que mande la noti desde adentro; este step corre afuera.
+      - name: Avisar a Slack si falló (sin pausar el cron)
+        # El cron NUNCA se pausa automáticamente — si falla, sigue intentando.
+        # El mensaje de Slack le dice exactamente qué pasó y qué hacer.
         if: ${{ (failure() || cancelled()) && env.SLACK_WEBHOOK_URL_ERROR != '' }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -218,65 +212,38 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           WORKFLOW_NAME: ${{ github.workflow }}
         run: |
-          # Conclusión del run inmediato anterior (el actual no aparece todavía en la lista).
-          PREV=$(gh run list --workflow="$WORKFLOW_NAME" --branch=main --limit=2 --json conclusion --jq '.[1].conclusion // "none"' 2>/dev/null || echo "none")
-          echo "Conclusión del run anterior: $PREV"
-          # Diagnóstico priorizando señales rápidas (estado + duración), después patrón en log.
-          DIAG="❓ No pude inferir el tipo de fallo. Revisá el run."
-          ACCION="Mirá el log del run para más pistas."
-          # Duración del job en segundos (este job, no del run completo)
+          DIAG="❓ No pude inferir el tipo de fallo."
+          ACCION="Escribí */bajada-tickets* en Slack para reintentar. Si sigue fallando, avisá a quien administra el bot."
           DUR=$(gh run view "$RUN_ID" --json jobs --jq '.jobs[0] | (.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)' 2>/dev/null || echo "0")
           echo "Duración job: ${DUR}s, status: $STATUS"
           if [ "$STATUS" = "cancelled" ]; then
-            DIAG="⏱️ El job se canceló (timeout 45min — el scraper se quedó colgado en algún paso)."
-            ACCION="Mirá el log para ver dónde se trabó. Si pasó muchas veces seguidas, refrescá la sesión: \`./scripts/refresh-session.sh\`"
-          elif [ "${DUR}" -lt 1800 ] 2>/dev/null && [ "${DUR}" != "0" ]; then
-            # < 30min con failure → early abort por captcha rechazado (5 intentos espaciados)
-            DIAG="🤖 Captcha rejected por Keycloak — el solver no pasó en los 5 intentos del run."
-            ACCION="Esto es intermitente; suele resolverse solo en alguna corrida cercana. Si persiste 2+ runs seguidos, el workflow se pausa solo y vas a recibir alerta roja."
+            DIAG="⏱️ El job tardó más de 45 minutos y se canceló solo."
+            ACCION="Escribí */bajada-tickets* para reintentar. Si pasa seguido, avisá a quien administra el bot."
           else
-            # Fallback: analizar log
             LOG=$(gh run view "$RUN_ID" --log 2>&1 || echo "")
             if echo "$LOG" | grep -q "Usuario o contraseña incorrectos"; then
-              DIAG="🔐 Keycloak rechazó las credenciales — probablemente cambió la password de Cecilia."
-              ACCION="Actualizá el secret con: \`gh secret set BA_PASSWORD --repo ${{ github.repository }}\`"
-            elif echo "$LOG" | grep -qE "BA Colaborativa parece estar caída|PlatformDownError|Angular.*body.*vacío"; then
-              DIAG="🌩️ BA Colaborativa no cargó — probable caída momentánea de la plataforma del GCBA."
-              ACCION="No hace falta hacer nada. El cron va a reintentar automáticamente."
-            elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal Server|backend.+ 5[0-9][0-9]"; then
-              DIAG="🌩️ Backend del GCBA caído (5xx). No es nuestro problema."
-              ACCION="Esperá 1-2h. La próxima corrida del cron probablemente pase."
-            elif echo "$LOG" | grep -qE "Error en el reCAPTCHA|captchas? rechazado|CaptchaRejectedError"; then
-              DIAG="🤖 Captcha rejected por Keycloak — el solver no pasa el score."
-              ACCION="Es intermitente. Si persiste 4+ runs, refrescá la sesión: \`./scripts/refresh-session.sh\`"
-            elif echo "$LOG" | grep -qE "0 tickets.*export.*vacío|export.*0 filas|0 filas.*export"; then
-              DIAG="📭 El export descargado tiene 0 tickets — el filtro no devolvió resultados o el archivo está corrupto."
-              ACCION="Revisá el filtro en BA Colaborativa y fijate si la bandeja tiene tickets abiertos."
-            elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.+selector|ng-select|addButton|modal.+Exportar"; then
-              DIAG="🧩 El SPA del GCBA cambió algo del DOM (selector roto)."
-              ACCION="Avisame para que investigue."
+              DIAG="🔐 La contraseña de BA Colaborativa está mal o cambió."
+              ACCION="Avisá a quien administra el bot — hay que actualizar la contraseña en los secrets de GitHub."
+            elif echo "$LOG" | grep -qE "BA Colaborativa parece estar caída|PlatformDownError"; then
+              DIAG="🌩️ BA Colaborativa (la web del GCBA) parece estar caída."
+              ACCION="No hace falta hacer nada. El bot va a reintentar solo en la próxima corrida automática."
+            elif echo "$LOG" | grep -qE "captchas? rechazado|CaptchaRejectedError|Error en el reCAPTCHA"; then
+              DIAG="🤖 El captcha del login no se pudo resolver."
+              ACCION="Suele resolverse solo. Escribí */bajada-tickets* en unas horas para reintentar."
+            elif echo "$LOG" | grep -qE "Target page.*closed|browser has been closed|Target closed"; then
+              DIAG="💥 El navegador se cayó mientras corría."
+              ACCION="Escribí */bajada-tickets* para reintentar — generalmente se soluciona solo."
+            elif echo "$LOG" | grep -qE "fuera de servicio|500 Internal|backend.+5[0-9][0-9]"; then
+              DIAG="🌩️ El servidor del GCBA devolvió un error (caída momentánea)."
+              ACCION="Esperá 1-2 horas y escribí */bajada-tickets* para reintentar."
+            elif echo "$LOG" | grep -qE "RuntimeError|TimeoutError.*selector|ng-select|modal.*Exportar"; then
+              DIAG="🧩 El sitio de BA Colaborativa cambió algo y el bot no lo reconoció."
+              ACCION="Avisá a quien administra el bot — necesita revisión técnica."
             fi
           fi
-          TRIGGER="cron \`$SCHEDULE\`"
-          [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="dispatch manual"
-          # Severidad según si es el 1er fail o el 2do consecutivo.
-          if [ "$PREV" = "success" ] || [ "$PREV" = "none" ]; then
-            # 1er fail del chain: alerta amarilla, no pausamos.
-            EMOJI="⚠️"
-            HEADER="⚠️ *BA Colaborativa: corrida falló* ($TRIGGER)"
-            EXTRA="_(Es la 1ra falla — el cron sigue corriendo. Si la próxima también falla, paso el cron a pausa y te aviso con alerta roja.)_"
-          else
-            # 2da+ falla consecutiva: alerta roja + pausar el cron.
-            EMOJI="🚨"
-            HEADER="🚨 *BA Colaborativa: 2 corridas seguidas fallaron — PAUSANDO el cron*"
-            # Pausar el cron para que no siga corriendo en loop.
-            if gh workflow disable "$WORKFLOW_NAME" --repo "${{ github.repository }}" 2>&1; then
-              EXTRA="_(El cron quedó **pausado**. Para reactivarlo después de arreglar: corré \`./scripts/refresh-session.sh\` (lo reactiva solo) o desde la UI de GitHub Actions.)_"
-            else
-              EXTRA="_(Intenté pausar el cron pero el comando falló. Pausalo manualmente desde Actions → Workflows → ... → Disable workflow.)_"
-            fi
-          fi
-          TEXT="$HEADER"$'\n'"*Diagnóstico:* $DIAG"$'\n'"*Qué hacer:* $ACCION"$'\n'"<$RUN_URL|Ver run en GitHub Actions>"$'\n'"$EXTRA"
+          TRIGGER="cron automático"
+          [ "$EVENT" = "workflow_dispatch" ] && TRIGGER="disparo manual"
+          TEXT="⚠️ *BA Colaborativa falló* ($TRIGGER)"$'\n'"*Qué pasó:* $DIAG"$'\n'"*Qué hacer:* $ACCION"$'\n'"<$RUN_URL|Ver detalle en GitHub Actions>"
           curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -nc --arg t "$TEXT" '{text: $t, username: "BA Colaborativa Bot", icon_emoji: ":rotating_light:"}')" \
             "$SLACK_WEBHOOK_URL_ERROR" || echo "(curl al webhook falló)"
